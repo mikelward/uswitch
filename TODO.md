@@ -3,11 +3,13 @@
 - **macOS.** Viable in part; `SPEC.md` rules it out today, so it starts there.
   - **First, by hand**: with the monitor on another input, `m1ddc set input VALUE`
     from the Mac. If the monitor doesn't come back, stop for that monitor and port.
-  - **Tried** (2026-10-31): an Intel Mac on the Dell's HDMI input. `ddcctl` finds the
-    monitor and its EDID, and `ioreg`'s `IODisplayEDID` parses with `parse_edid` as is.
-    Reading `0x60` times out, and writing `0x11` from another input doesn't switch, so
-    HDMI from that Mac is unsupported. Next: USB-C to the Dell's DisplayPort input,
-    then `ddcctl -d 1 -i 15` from another input.
+  - **Tried** (2026-10-31): an Intel Mac on the Dell's HDMI input, then its USB-C input.
+    `ddcctl` finds the monitor and its EDID, and `ioreg`'s `IODisplayEDID` parses with
+    `parse_edid` as is, but no DDC/CI gets through on either port: reading `0x60` times
+    out, writing the input from another one doesn't switch, a brightness write leaves
+    the monitor alone, and MonitorControl falls back to dimming in software. That Mac
+    is unsupported; DisplayPort from the same Thunderbolt port is the same output, so
+    it wasn't tried. Resuming needs a Mac whose port passes DDC/CI.
   - **Switching**: `m1ddc` (Apple silicon) or `ddcctl` (Intel), free from Homebrew.
     Both use a private API (as MonitorControl and BetterDisplay do), so an OS update
     can break them. Several Apple silicon HDMI ports (M1/M2 Mac mini) pass no DDC/CI;
