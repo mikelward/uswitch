@@ -1,10 +1,28 @@
 # TODO
 
-- **macOS.** Can any of uswitch run on macOS? DDC/CI input switching works there
-  through `m1ddc` (Apple silicon) or `ddcctl` (Intel), and display-switch shows a USB
-  trigger is possible, but udev, systemd, logind and acpid have no macOS equivalents
-  (launchd, IOKit notifications, power-button handling would all be new). Scope what
-  a macOS port would cover before building; `SPEC.md` rules it out today.
+- **macOS.** Viable in part; `SPEC.md` rules it out today, so it starts there.
+  - **First, by hand**: with the monitor on another input, `m1ddc set input VALUE`
+    from the Mac. If the monitor doesn't come back, stop for that monitor and port.
+  - **Switching**: `m1ddc` (Apple silicon) or `ddcctl` (Intel), free from Homebrew.
+    Both use a private API (as MonitorControl and BetterDisplay do), so an OS update
+    can break them. Several Apple silicon HDMI ports (M1/M2 Mac mini) pass no DDC/CI;
+    USB-C/Thunderbolt to DisplayPort does.
+  - **Best effort** (decided): it works where the hardware allows. Older Apple silicon
+    Macs and ports that can't switch are documented as unsupported, not worked around.
+  - **Shared logic**: EDIDs come from `ioreg`, so desks (D6, D11), the desk check and
+    D12's waits carry over; a macOS backend fills `Context` instead of sysfs and
+    `ddcutil`.
+  - **Triggers**: a shortcut through Shortcuts.app or Hammerspoon (easy); wake through
+    `sleepwatcher` or a helper listening for wake (yes); USB arrival through a launchd
+    agent on IOKit matching or a resident watcher, which needs a small Swift helper
+    since Python's standard library can't subscribe to IOKit (yes, with a resident
+    process, against D3's "nothing runs between triggers"); a power-button wake from
+    `pmset -g log`'s wake reason (unproven, and parsing it is fragile); the power
+    button while awake (no: macOS has no hook for it).
+  - **Unknowns**: whether switching works before login, since these tools run in a
+    user session.
+  - **Proposed scope**: shortcut, wake and USB triggers on `m1ddc` plus a Swift event
+    helper; no power button while awake.
 
 ## Decisions needing review
 
