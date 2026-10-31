@@ -332,8 +332,11 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
   serial, the EDID fields D6 identifies it by; a monitor without a serial is identified
   by its EDID UUID. Every command addresses a monitor by the system UUID from the same
   listing, never by list number (D6).
-- USB devices come from `ioreg`. A device that re-enumerates gets a new IOKit session ID,
-  which stands in for the USB device number D12 recognizes a press by.
+- USB devices come from `ioreg`. A device's IOKit location ID (`0x14100000`, as System
+  Information shows it) stands in for the port path a pin records (D1); its digits after
+  the bus are the hub tiers, so it gives the depth D2 picks by. A device that
+  re-enumerates gets a new IOKit session ID, which stands in for the USB device number
+  D12 recognizes a press by.
 
 ## Commands
 
