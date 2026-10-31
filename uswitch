@@ -149,6 +149,7 @@ class Context:
     stderr: object = sys.stderr
     timing: Timing = field(default_factory=Timing)
     self_path: str = os.path.abspath(__file__)
+    platform: object = field(default_factory=lambda: Linux())
 
     @property
     def live(self):
@@ -162,7 +163,7 @@ class Context:
         print(message, file=self.stdout, flush=True)
 
     def warn(self, message):
-        print(f"uswitch: {message}", file=self.stderr, flush=True)
+        print(f"{self.platform.name}: {message}", file=self.stderr, flush=True)
 
     def ask(self, prompt, default=""):
         shown = f"{prompt} [{default}] " if default else f"{prompt} "
@@ -781,6 +782,52 @@ class Ddc:
         return None if r.returncode == 0 else r.message()
 
 
+# --- Platforms (D14) ----------------------------------------------------------
+
+
+class Linux:
+    """Where uswitch finds monitors, USB devices and DDC/CI on Linux: the
+    kernel's DRM connectors and USB devices in sysfs, and ddcutil, run as root
+    (D4, D6). Desks, learning and the waits are shared, and reach the system
+    only through a platform (D14)."""
+
+    name = "uswitch"
+    learn_command = "sudo uswitch learn"
+    ddc_check = "`ddcutil detect`"
+    written = f"/{CONFIG} and the udev rule"
+
+    def config_path(self, ctx):
+        return ctx.path(CONFIG)
+
+    def require_privilege(self, ctx):
+        require_root(ctx)
+
+    def can_read(self, ctx):
+        """Whether this user can talk to the monitors: /dev/i2c-* is root's."""
+        return not ctx.live or ctx.euid == 0
+
+    def monitors(self, ctx):
+        return connected_monitors(ctx.sysfs)
+
+    def usb_devices(self, ctx):
+        return usb_devices(ctx.sysfs)
+
+    def ddc(self, ctx):
+        return Ddc(ctx)
+
+    def power_button_woke(self, ctx):
+        return power_button_woke(ctx)
+
+    def write_triggers(self, ctx, config):
+        write_rules(ctx, config)
+
+    def install(self, ctx):
+        return install(ctx)
+
+    def uninstall(self, ctx, purge):
+        return uninstall(ctx, purge)
+
+
 # --- Switching (D10, D11, D12) -----------------------------------------------
 
 
@@ -861,10 +908,11 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
     """Switch this desk's connected monitors to this machine. Returns the exit status."""
     clock, timing = ctx.clock, ctx.timing
     start = clock.now()
+    platform = ctx.platform
     if not config.monitors:
-        ctx.say("No desk learned yet: run `sudo uswitch learn`.")
+        ctx.say(f"No desk learned yet: run `{platform.learn_command}`.")
         return 0
-    woke = config.power_button and not dry_run and power_button_woke(ctx)
+    woke = config.power_button and not dry_run and platform.power_button_woke(ctx)
     if power_button_only and not woke:
         ctx.say("The power button didn't wake this machine: nothing to do.")
         return 0
@@ -872,7 +920,7 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
         ctx.say("The power button woke this machine: switching whatever the desk check says.")
         force = True
     while True:
-        pairs = present(config, connected_monitors(ctx.sysfs))
+        pairs = present(config, platform.monitors(ctx))
         if pairs or dry_run or clock.now() - start >= timing.appear:
             break
         clock.sleep(timing.poll)
@@ -881,7 +929,7 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
         return 0
     desks = sorted({m.desk for m, _ in pairs})
     ctx.say(f"At desk {', '.join(desks)} after {clock.now() - start:.1f}s.")
-    ddc = Ddc(ctx)
+    ddc = platform.ddc(ctx)
     if dry_run:
         return _dry_run(ctx, config, ddc, pairs, force)
     runs = [MonitorRun(m) for m in config.monitors if m.desk in desks]
@@ -907,7 +955,7 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
         run folds the resume's start into it, so every pass looks, and records
         each press even once forced, so none is left for a later run."""
         nonlocal force
-        if not (config.power_button and power_button_woke(ctx)):
+        if not (config.power_button and platform.power_button_woke(ctx)):
             return False
         force = True
         for r in runs:
@@ -918,8 +966,8 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
         if notice_power():
             ctx.say("The power button was pressed; checking the monitors again, whatever the desk check says.")
         now = clock.now()
-        connectors = connected_monitors(ctx.sysfs)
-        devices = usb_devices(ctx.sysfs) if usb_desks else {}
+        connectors = platform.monitors(ctx)
+        devices = platform.usb_devices(ctx) if usb_desks else {}
         if notice_presses(devices):
             ctx.say("The switch went away and came back; checking the monitors again.")
         for r in runs:
@@ -939,13 +987,13 @@ def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
             elif not r.done:
                 # The snapshot above is older than the read _step makes first, so
                 # it looks again right before writing (D12).
-                _step(ctx, ddc, r, connector, lambda d=desk: desk_check(d, usb_devices(ctx.sysfs) if d.usb else {}, force))
+                _step(ctx, ddc, r, connector, lambda d=desk: desk_check(d, platform.usb_devices(ctx) if d.usb else {}, force))
         if clock.now() - start >= timing.run:
             break
         if all(r.done for r in runs):
             # A press away and back during the steps above would be lost once this
             # run ends, folded into it by systemd: look once more before leaving.
-            pressed = bool(usb_desks) and notice_presses(usb_devices(ctx.sysfs))
+            pressed = bool(usb_desks) and notice_presses(platform.usb_devices(ctx))
             powered = notice_power()
             if not pressed and not powered:
                 break
@@ -1009,7 +1057,7 @@ def _step(ctx, ddc, r, connector, may_write):
 
 
 def _dry_run(ctx, config, ddc, pairs, force):
-    devices = usb_devices(ctx.sysfs)
+    devices = ctx.platform.usb_devices(ctx)
     for m, c in pairs:
         desk = config.desks[m.desk]
         value, why = ddc.get_input(c)
@@ -1043,11 +1091,11 @@ def watch_press(ctx, before):
         if clock.now() - start >= timing.learn_press:
             raise UswitchError(f"no USB device left within {timing.learn_press:g}s; was the switch pressed?")
         clock.sleep(timing.poll)
-        current = usb_devices(ctx.sysfs)
+        current = ctx.platform.usb_devices(ctx)
         gone = {p: d for p, d in before.items() if current.get(p) != d}
     first_back = None
     while True:
-        current = usb_devices(ctx.sysfs)
+        current = ctx.platform.usb_devices(ctx)
         gone.update({p: d for p, d in before.items() if current.get(p) != d})
         back = [d for p, d in gone.items() if current.get(p) == d]
         now = clock.now()
@@ -1126,12 +1174,13 @@ def _prove(ctx, ddc, pairs, label_away):
 
 
 def learn(ctx, desk_name=None, usb_spec=None):
-    require_root(ctx)
-    config_path = ctx.path(CONFIG)
+    platform = ctx.platform
+    platform.require_privilege(ctx)
+    config_path = platform.config_path(ctx)
     config = load_config(config_path) or Config()
-    ddc = Ddc(ctx)
+    ddc = platform.ddc(ctx)
     pairs = []
-    for c in connected_monitors(ctx.sysfs):
+    for c in platform.monitors(ctx):
         probe = monitor_from_edid(c.edid, "", 0)
         if any(m.same_monitor(probe) for m, _ in pairs):
             ctx.warn(f"{probe.label}: identical to another connected monitor, with no serial to tell them apart; skipping it.")
@@ -1144,14 +1193,14 @@ def learn(ctx, desk_name=None, usb_spec=None):
         ctx.say(f"{probe.label}: showing {input_name(value)}, this machine's input.")
         pairs.append((probe, c))
     if not pairs:
-        raise UswitchError("no connected monitor answers DDC/CI; check its DDC/CI setting and `ddcutil detect`")
+        raise UswitchError(f"no connected monitor answers DDC/CI; check its DDC/CI setting and {platform.ddc_check}")
     monitors = [m for m, _ in pairs]
     owners = sorted({o.desk for o in config.monitors for m in monitors if o.same_monitor(m)})
     if desk_name is None:
         desk_name = ctx.ask("Name this desk:", owners[0] if len(owners) == 1 else _next_desk_name(config))
     if not DESK_NAME.fullmatch(desk_name):
         raise UswitchError("desk names are letters, digits, '.', '_' and '-'", code=2)
-    devices = usb_devices(ctx.sysfs)
+    devices = platform.usb_devices(ctx)
     if usb_spec:
         setup_a = True
     else:
@@ -1162,34 +1211,34 @@ def learn(ctx, desk_name=None, usb_spec=None):
         setup_a = answer == "a"
     away_hint = (
         f"After pressing it back, if the monitors didn't follow to the other machine, switch each one\n"
-        f"to another input with its buttons within {ctx.timing.learn_away:g}s; uswitch switches it back."
+        f"to another input with its buttons within {ctx.timing.learn_away:g}s; {platform.name} switches it back."
     )
     usb = None
     if setup_a and usb_spec:
         usb = trigger_for(_usb_from_spec(ctx, usb_spec, devices), devices)
         ctx.say(f"Within {ctx.timing.learn_away:g}s, switch each monitor to another input with its buttons;")
-        ctx.say("uswitch then switches it back.")
+        ctx.say(f"{platform.name} then switches it back.")
         ctx.ask("Press Enter to start.")
     elif setup_a:
         ctx.say("Press the USB switch to another machine, then press it back. The screen and keyboard")
         ctx.say("may go to the other machine in between; nothing here needs a key until they're back.")
         ctx.say(away_hint)
         ctx.ask("Press Enter, then press the switch.")
-        returned = watch_press(ctx, usb_devices(ctx.sysfs))
-        devices = usb_devices(ctx.sysfs)
+        returned = watch_press(ctx, platform.usb_devices(ctx))
+        devices = platform.usb_devices(ctx)
         device = _pick(ctx, trigger_candidates(returned), "More than one device came and went with the switch; pick its own hub:")
         usb = trigger_for(device, devices)
     else:
         ctx.say(f"Within {ctx.timing.learn_away:g}s, switch each monitor to another input with its buttons. Its KVM")
-        ctx.say("takes the keyboard with it; uswitch switches it back, and the keyboard returns.")
+        ctx.say(f"takes the keyboard with it; {platform.name} switches it back, and the keyboard returns.")
         ctx.ask("Press Enter to start.")
     if usb:
         pinned = " (port pinned: the ID alone isn't unique, or its serial isn't safe to match)" if usb.port else ""
         ctx.say(f"Trigger: {usb.describe()}{pinned}.")
     config = replace_desk(config, desk_name, usb, monitors)
     write_file(config_path, config_text(config))
-    write_rules(ctx, config)
-    ctx.say(f"Wrote desk {desk_name} to /{CONFIG} and the udev rule.")
+    platform.write_triggers(ctx, config)
+    ctx.say(f"Wrote desk {desk_name} to {platform.written}.")
     ok = _prove(ctx, ddc, pairs, "switched back from another input.")
     return 0 if ok else 1
 
@@ -1364,15 +1413,16 @@ def uninstall(ctx, purge=False):
 
 
 def status(ctx):
-    config = load_config(ctx.path(CONFIG))
+    platform = ctx.platform
+    config = load_config(platform.config_path(ctx))
     if config is None:
-        ctx.say("No desk learned yet: run `sudo uswitch learn`.")
+        ctx.say(f"No desk learned yet: run `{platform.learn_command}`.")
         return 0
-    connectors = connected_monitors(ctx.sysfs)
-    devices = usb_devices(ctx.sysfs)
+    connectors = platform.monitors(ctx)
+    devices = platform.usb_devices(ctx)
     pairs = dict((m.label, c) for m, c in present(config, connectors))
-    can_read = not ctx.live or ctx.euid == 0
-    ddc = Ddc(ctx)
+    can_read = platform.can_read(ctx)
+    ddc = platform.ddc(ctx)
     ctx.say(f"wake: {'on' if config.wake else 'off'}")
     ctx.say(f"power button: {'on' if config.power_button else 'off'}")
     for name in sorted(config.desks):
@@ -1421,14 +1471,14 @@ def main(argv=None, ctx=None):
     ctx = ctx or Context()
     try:
         if args.command == "install":
-            return install(ctx)
+            return ctx.platform.install(ctx)
         if args.command == "uninstall":
-            return uninstall(ctx, args.purge)
+            return ctx.platform.uninstall(ctx, args.purge)
         if args.command == "learn":
             return learn(ctx, args.desk, args.usb)
         if args.command == "switch":
-            require_root(ctx)
-            config = load_config(ctx.path(CONFIG)) or Config()
+            ctx.platform.require_privilege(ctx)
+            config = load_config(ctx.platform.config_path(ctx)) or Config()
             return switch(ctx, config, force=args.force, dry_run=args.dry_run, power_button_only=args.power_button_only)
         return status(ctx)
     except UswitchError as e:
