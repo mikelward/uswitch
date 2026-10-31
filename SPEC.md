@@ -18,22 +18,25 @@ show this machine's input. It serves two setups:
   monitor's KVM brings the keyboard and mouse along (D10).
 
 A machine can sit at several desks, a laptop at home and at work say, each set up either
-way (D11).
+way (D11). On an Apple silicon Mac the same program runs as `mswitch` (D14).
 
 This file is the contract: what uswitch does and why. Mechanics belong in code and tests.
 
 ## Scope
 
-- **Linux only**, on systemd distributions (Debian, Ubuntu, Fedora). Not portable to
-  macOS, Windows, or non-systemd init.
+- **Linux**, on systemd distributions (Debian, Ubuntu, Fedora), and **macOS on Apple
+  silicon** as `mswitch`, best effort (D14). Not portable to Windows, Intel Macs, or
+  non-systemd init.
 - **Dell monitors are the tested target.** Any monitor that honors MCCS VCP `0x60` from an
   input it isn't showing should work, but only Dell is supported.
-- **External binary: `ddcutil`** (packaged as `ddcutil` on all three distributions). It does
-  the DDC/CI protocol work; uswitch decides when and what to send.
+- **External binary: `ddcutil`** on Linux (packaged as `ddcutil` on all three
+  distributions), **`m1ddc`** on macOS (Homebrew). It does the DDC/CI protocol work;
+  uswitch decides when and what to send.
 - **External daemon: `acpid`** (packaged as `acpid` on all three), for the power button
   (D13), unless that is turned off. It is small, long-standing, and runs a command per ACPI
   event; uswitch only adds one event file.
-- No network, no resident process of uswitch's own, no cost. The hot path is a button press to a monitor
+- No network, no cost, and on Linux no resident process of uswitch's own; on macOS one
+  small helper waits for triggers (D15). The hot path is a button press to a monitor
   switch, targeted at under about two seconds.
 
 ## How it works
@@ -282,6 +285,54 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - At a setup B desk every wake already switches; the power button changes nothing there
   except while awake.
 
+### D14. On a Mac it is `mswitch`: the same program, on Apple silicon, best effort
+
+- **One program.** The same file runs on macOS with a macOS backend and is installed as
+  `mswitch`. Desks and the desk check (D11), learning (D2), the waits (D12), identity by
+  EDID (D6) and the configuration's format are shared, so a fix to either lands in both.
+- **Apple silicon, through `m1ddc`.** It reaches a monitor's DDC/CI through a private macOS
+  interface, the one MonitorControl and BetterDisplay use, so a macOS update can break it.
+  Intel Macs aren't supported: the one tested reached its Dell over neither HDMI nor
+  USB-C, with `ddcctl` or MonitorControl.
+- **Best effort.** USB-C or Thunderbolt straight to the monitor's DisplayPort or USB-C input
+  is the supported connection. A Mac or port that doesn't pass DDC/CI (several built-in
+  HDMI ports, M1 and entry-level M2 among them) is documented as unsupported, not worked
+  around.
+
+### D15. On a Mac it runs as the user, with one helper
+
+- **Per user, not system-wide** (unlike D4). `m1ddc` finds monitors through the window
+  server, which only a logged-in user's session reaches, so `mswitch` runs as that user:
+  no `sudo`, the configuration in the user's Library, a LaunchAgent in place of units.
+  Until Phase 0 shows otherwise, nothing switches at the login window.
+- **One helper.** Python's standard library can't subscribe to IOKit's device arrivals or
+  to the wake notification, so a small Swift helper, which `install` compiles, runs while
+  the user is logged in and starts `mswitch switch` on each trigger. It is uswitch's one
+  resident process (unlike D3); between triggers it only waits. `learn` rewrites its
+  trigger list, as it rewrites the udev rule on Linux.
+- **One run at a time.** `mswitch switch` holds a lock; a start that finds it held leaves
+  the trigger to the run in progress, as systemd folds a start into one (D12).
+
+### D16. On a Mac, three triggers
+
+- **`usb`** (setup A): the configured trigger device arrives, matched as D1, with IOKit's
+  location ID for the port pin.
+- **`wake`**: at login and on every wake from sleep, with the same desk check (D10, D11),
+  and the same `[wake] enabled = no` to turn it off.
+- **manual**: `mswitch switch` from a shortcut (Shortcuts.app, or a hotkey tool). It runs
+  as the user, so no password rule is needed.
+- **No `power`.** macOS offers no hook for the power button while the Mac is awake, and no
+  reliable way to tell a wake by the power button from any other (D13 is Linux only).
+
+### D17. On a Mac, monitors come from `m1ddc` and USB devices from `ioreg`
+
+- `m1ddc display list detailed` gives each monitor's manufacturer, product name and
+  serial, the EDID fields D6 identifies it by; a monitor without a serial is identified
+  by its EDID UUID. Every command addresses a monitor by the system UUID from the same
+  listing, never by list number (D6).
+- USB devices come from `ioreg`. A device that re-enumerates gets a new IOKit session ID,
+  which stands in for the USB device number D12 recognizes a press by.
+
 ## Commands
 
 | Command | Does |
@@ -291,6 +342,9 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 | `uswitch learn [--desk NAME] [--usb VENDOR:PRODUCT[:SERIAL]]` | Learn this desk's trigger and monitor inputs; write config and rule (D2, D11). |
 | `uswitch switch [--dry-run] [--force] [--power-button-only]` | Switch the connected monitors to this machine, after the desk check unless `--force` or a power-button wake; with `--power-button-only`, only on a power-button wake; what the units run (D10, D11, D13). |
 | `uswitch status` | Show the configured desks, which one is connected, whether its trigger is present, and each monitor's current input against this machine's. |
+
+On a Mac the commands are the same as `mswitch`, without `sudo`; `--power-button-only`
+doesn't apply (D16).
 
 ## What gets installed
 
@@ -316,6 +370,17 @@ also enables `acpid.service`, and leaves it enabled on uninstall.
 `uninstall` removes all of them except the configuration, which `--purge` removes too.
 Each run also records the power button's wakeup counts in `/run/uswitch/power-button`,
 which goes with the next boot (D13).
+
+On a Mac, everything is the user's own (D15):
+
+| Path | Written by | Does |
+|---|---|---|
+| `~/.local/bin/mswitch` | `install` | The program. A shortcut calls it by this full path. |
+| `~/Library/Application Support/mswitch/mswitch.conf` | `learn` | Desks, monitors and inputs (*Configuration*). |
+| `~/Library/Application Support/mswitch/mswitch-helper` | `install` | The helper (D15), compiled from `mswitch-helper.swift`. |
+| `~/Library/LaunchAgents/com.github.mikelward.mswitch.plist` | `install`, `learn` | Runs the helper while the user is logged in, with the desks' trigger devices (D16). |
+
+`uninstall` removes them all except the configuration, which `--purge` removes too.
 
 ## Configuration
 
@@ -416,11 +481,32 @@ On each machine, before any code:
    monitor isn't showing; whether a monitor in power saving answers, and whether
    `setvcp 0x60` wakes it; whether a second `setvcp 0x60` sent mid-switch is ignored.
 
+On a Mac (D14–D17), with `m1ddc` from Homebrew:
+
+1. `m1ddc display list detailed`: each Dell appears with its manufacturer, product name and
+   serial.
+2. With the monitor showing the Mac, `m1ddc display UUID get input`: note the value.
+3. Switch the monitor to another input with its buttons, then `m1ddc display UUID set
+   input VALUE`. As on Linux, **this step decides whether `mswitch` can work** for that
+   monitor and port. Time it.
+4. Setup A: `ioreg -p IOUSB -w0 -l` before and after pressing the switch: the switch's hub
+   appears, with a new session ID.
+5. Sleep the Mac, switch the monitor away, wake the Mac, and run step 3 at once: how long
+   until `m1ddc` lists the monitor and the switch lands (D12).
+6. Log out, and run step 3 over `ssh` at the login window: whether anything can switch
+   before login (D15).
+
 ## Implementation
 
 Python 3.10 or later (Ubuntu 22.04's), standard library only, in one executable file,
-`uswitch`, that runs from a checkout with no build step. `ddcutil` is the only external
-binary. The configuration is read and written with `configparser`.
+`uswitch`, that runs from a checkout with no build step. On Linux `ddcutil` is the only
+external binary. The configuration is read and written with `configparser`.
+
+On a Mac, `mswitch` needs Homebrew's Python, since the one with the Command Line Tools is
+3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`,
+plus `ioreg` and `launchctl` from macOS. `install` builds the helper from
+`mswitch-helper.swift`, one file beside `uswitch`, with `swiftc` from the Command Line
+Tools; nothing else is compiled.
 
 ## Testing
 
@@ -443,8 +529,12 @@ binary. The configuration is read and written with `configparser`.
 - Power-button wakes (D13) against a fake `/sys/class/wakeup`: a count that grew between
   runs skips the desk check; an unchanged one, the first run after boot, another wakeup
   source, or the setting off don't.
-- Real udev, real monitors and the USB switch need hardware: Phase 0, then a manual
-  checklist per release.
+- The macOS backend runs in the same suite on Linux, against faked `m1ddc` and `ioreg`
+  output and a fake `launchctl`: identity, the lock (D15), the LaunchAgent as text, and
+  the desk checks above. The helper builds on a macOS runner, only in pull requests that
+  change it.
+- Real udev, real monitors, the USB switch and a real Mac need hardware: Phase 0, then a
+  manual checklist per release.
 
 ## Known limitations
 
@@ -459,6 +549,8 @@ binary. The configuration is read and written with `configparser`.
   doesn't count when it wakes the machine, wakes it without skipping the desk check (D13);
   Phase 0 step 7 tells. A press while awake that acpid misses goes uncounted until the next
   run, which then takes it as a wake.
+- On a Mac, nothing switches at the login window until Phase 0 shows it can (D15), and a
+  macOS update can break `m1ddc`'s private interface (D14).
 
 ## Out of scope
 
@@ -466,7 +558,7 @@ binary. The configuration is read and written with `configparser`.
 - Moving the USB devices themselves; the switch does that.
 - Coordinating machines over the network, or a software KVM (Barrier, Input Leap).
 - Audio routing.
-- Non-Dell monitors beyond best effort; non-Linux; non-systemd.
+- Non-Dell monitors beyond best effort; Windows; Intel Macs; non-systemd Linux.
 
 ## Prior art
 
