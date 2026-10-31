@@ -310,8 +310,10 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
   the user is logged in and starts `mswitch switch` on each trigger. It is uswitch's one
   resident process (unlike D3); between triggers it only waits. `learn` rewrites its
   trigger list, as it rewrites the udev rule on Linux.
-- **One run at a time.** `mswitch switch` holds a lock; a start that finds it held leaves
-  the trigger to the run in progress, as systemd folds a start into one (D12).
+- **One run at a time, no trigger lost.** `mswitch switch` records the trigger, then
+  takes a lock; a start that finds it held leaves the trigger to the run in progress,
+  as systemd folds a start into one (D12). The run holding the lock runs again while a
+  trigger is pending, so a monitor it had already finished with comes back too.
 
 ### D16. On a Mac, three triggers
 
