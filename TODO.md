@@ -1,8 +1,8 @@
 # TODO
 
-- **macOS** (`mswitch`, `SPEC.md` D14–D17). Built ahead of its Phase 0, since no Apple
-  silicon Mac is on hand yet: those steps decide whether it works, before anyone relies
-  on it. Still to come: `README.md` for macOS.
+- **macOS** (`mswitch`, `SPEC.md` D14–D17): run Phase 0's Mac steps on an Apple silicon
+  Mac. It was built ahead of them, since none is on hand yet; they decide whether it
+  works, before anyone relies on it.
   - **Tried** (2026-10-31): an Intel Mac on the Dell's HDMI input, then its USB-C input.
     `ddcctl` finds the monitor and its EDID, and `ioreg`'s `IODisplayEDID` parses with
     `parse_edid` as is, but no DDC/CI gets through on either port: reading `0x60` times
