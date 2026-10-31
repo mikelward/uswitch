@@ -1,7 +1,7 @@
 # uswitch
 
 uswitch switches your monitors to this machine when this machine should have them: when a
-USB switch selects it, when it wakes, or when you ask.
+USB switch selects it, when it wakes, when you press its power button, or when you ask.
 
 Every monitor is cabled to every machine on its own input, every machine runs uswitch, and
 on a trigger uswitch tells each monitor over DDC/CI (VCP feature `0x60`, input source) to
@@ -30,7 +30,10 @@ This file is the contract: what uswitch does and why. Mechanics belong in code a
   input it isn't showing should work, but only Dell is supported.
 - **External binary: `ddcutil`** (packaged as `ddcutil` on all three distributions). It does
   the DDC/CI protocol work; uswitch decides when and what to send.
-- No network, no resident process, no cost. The hot path is a button press to a monitor
+- **External daemon: `acpid`** (packaged as `acpid` on all three), for the power button
+  (D13), unless that is turned off. It is small, long-standing, and runs a command per ACPI
+  event; uswitch only adds one event file.
+- No network, no resident process of uswitch's own, no cost. The hot path is a button press to a monitor
   switch, targeted at under about two seconds.
 
 ## How it works
@@ -46,7 +49,8 @@ In setup A:
 4. The machine you left does nothing.
 
 In either setup, systemd also starts the unit when the machine boots or resumes; in
-setup A that wake only switches if the switch already points here (D10).
+setup A that wake only switches if the switch already points here (D10). Pressing the
+machine's power button, to wake it or while it is awake, always switches (D13).
 
 **Only the gaining machine acts.** It is the one that knows it was picked, and the one
 whose cable is certain to be connected. Switching away on removal would need to know where
@@ -136,7 +140,7 @@ resume re-enumerates the devices while the switch points here, the monitors swit
 consistent with the invariant, and a resume where they stayed connected switches too,
 through the wake trigger (D10). A machine that boots or wakes while the switch points
 elsewhere finds no trigger device and does nothing, so **a waking machine can't steal the
-display**. The monitor itself can: Dell's *Auto Select* and *USB-C Prioritization* jump
+display**, unless its power button woke it: a press is a request for the monitors (D13). The monitor itself can: Dell's *Auto Select* and *USB-C Prioritization* jump
 to whichever input just found a signal. Turn both off (see *Setup*).
 
 ### D6. Monitors are identified by EDID, never by display or bus number
@@ -173,10 +177,10 @@ installed path and one command writing and removing the same list can't drift fr
 - `sudo uswitch uninstall` removes everything `install` and `learn` wrote, and reloads udev
   and systemd. It keeps `/etc/uswitch.conf` unless given `--purge`.
 
-### D10. Three triggers, one action
+### D10. Four triggers, one action
 
-Every trigger starts the same `uswitch.service`, so they run the same check (D11), behave
-the same, and fold together when they coincide.
+Every trigger runs the same `uswitch switch`, so they run the same check (D11), behave
+the same, and fold together when they coincide; the power button's skips the check (D13).
 
 - **`usb`** (setup A): a configured trigger device arrives (D1).
 - **`wake`**: the machine boots (once the rest of boot is done, so boot never waits on it)
@@ -194,6 +198,7 @@ the same, and fold together when they coincide.
   switching inputs is the whole of what it grants. At a setup A desk it does nothing while
   the switch points elsewhere, as the invariant says (D5); `sudo uswitch switch --force`
   skips the check.
+- **`power`**: the power button (D13).
 
 ### D11. A machine can belong to several desks, and the monitors say which
 
@@ -245,6 +250,38 @@ the code. The orderings it respects:
 - Whether to switch several monitors in parallel waits on Phase 0's timings. ddcutil keeps
   the protocol's own delays between commands.
 
+### D13. The power button always switches
+
+Pressing a machine's power button asks for the monitors, so it switches them to that
+machine past the desk check (D11), at either kind of desk. On by default; turn it off with
+`[power_button] enabled = no` and rerun `sudo uswitch install`.
+
+- **While awake**, the press no longer suspends or powers off. `install` sets logind's
+  `HandlePowerKey=ignore` and adds an acpid event that starts `uswitch-power.service`,
+  which runs `uswitch switch --force`. A separate unit, so a press during another run is
+  not folded into that run's desk check; both write the same input. A long press still
+  powers off in firmware. logind takes the setting on reload where it supports one;
+  restarting logind can end sessions, so otherwise it waits for the next boot. A desktop
+  session (KDE, GNOME) takes the power key from logind while it runs: set its power-button
+  action to *Do nothing*, or it acts on the press too.
+- **Waking from sleep**, the press usually never reaches acpid. The kernel counts it on the
+  power button's wakeup source (`PNP0C0C` or `LNXPWRBN` in `/sys/class/wakeup`). Every run
+  records those counts in `/run/uswitch/power-button`; a press while awake starts a run
+  that records it, so a count that grew between runs is a press that woke the machine, and
+  that run skips the desk check. A run looks on every pass, and once more before it
+  ends, since a suspend and resume during a run folds the resume's start into it; a press
+  it finds starts every monitor over, like a press of the switch (D12). A boot records the first counts and never counts as a
+  press, since a reboot, power restore or Wake-on-LAN looks the same; a machine booted
+  with its power button switches only through the usual check. With `wake` off, `install`
+  hooks `uswitch-power-wake.service` to boot and resume instead, running `uswitch switch
+  --power-button-only`, which switches only on a power-button wake; its boot run only
+  records the counts.
+- **One handler.** `install` refuses while another acpid event file acts on the power
+  button: a distribution's acpid can ship one that powers off the machine. It names the file to
+  move aside. An unwanted press, a cat on the desk say, takes the display.
+- At a setup B desk every wake already switches; the power button changes nothing there
+  except while awake.
+
 ## Commands
 
 | Command | Does |
@@ -252,7 +289,7 @@ the code. The orderings it respects:
 | `uswitch install` | Install, then `learn` if unconfigured (D9). |
 | `uswitch uninstall [--purge]` | Remove what `install` and `learn` wrote (D9). |
 | `uswitch learn [--desk NAME] [--usb VENDOR:PRODUCT[:SERIAL]]` | Learn this desk's trigger and monitor inputs; write config and rule (D2, D11). |
-| `uswitch switch [--dry-run] [--force]` | Switch the connected monitors to this machine, after the desk check unless `--force`; what the unit runs (D10, D11). |
+| `uswitch switch [--dry-run] [--force] [--power-button-only]` | Switch the connected monitors to this machine, after the desk check unless `--force` or a power-button wake; with `--power-button-only`, only on a power-button wake; what the units run (D10, D11, D13). |
 | `uswitch status` | Show the configured desks, which one is connected, whether its trigger is present, and each monitor's current input against this machine's. |
 
 ## What gets installed
@@ -268,8 +305,17 @@ never runs uswitch itself (D3).
 | `/etc/systemd/system/uswitch.service` | `install` | The oneshot that runs `uswitch switch`, hooked to boot and resume while `wake` is on. |
 | `/etc/polkit-1/rules.d/50-uswitch.rules` | `install` | Lets the active local user start `uswitch.service` from a shortcut. |
 | `/etc/modules-load.d/uswitch.conf` | `install` | Loads `i2c-dev` at boot. |
+| `/etc/systemd/system/uswitch-power.service` | `install` | The oneshot acpid starts on a power-button press: `uswitch switch --force` (D13). |
+| `/etc/systemd/system/uswitch-power-wake.service` | `install` | Hooked to boot and resume only while `wake` is off: `uswitch switch --power-button-only` (D13). |
+| `/etc/acpi/events/uswitch` | `install` | On `button/power`, start `uswitch-power.service` (D13). |
+| `/etc/systemd/logind.conf.d/uswitch.conf` | `install` | `HandlePowerKey=ignore`, so a press doesn't suspend (D13). |
+
+The last four only while `power_button` is on; `install` removes them when it is off. It
+also enables `acpid.service`, and leaves it enabled on uninstall.
 
 `uninstall` removes all of them except the configuration, which `--purge` removes too.
+Each run also records the power button's wakeup counts in `/run/uswitch/power-button`,
+which goes with the next boot (D13).
 
 ## Configuration
 
@@ -278,6 +324,10 @@ Written by `learn` and readable by hand. The values below are placeholders:
 ```ini
 # On by default; each desk's check still applies (D10, D11).
 [wake]
+enabled = yes
+
+# On by default: the power button switches past the desk check (D13).
+[power_button]
 enabled = yes
 
 # Setup A: the switch's own hub (D1).
@@ -356,7 +406,10 @@ On each machine, before any code:
    run step 3 at once: whether the link is back in time, how long it took (D12), and whether
    the monitor's KVM moves its USB ports when DDC/CI changes the input, as it does for the
    buttons.
-7. The numbers and quirks D12's bounds need: how long after a press the hub appears
+7. The power button (D13): `cat /sys/class/wakeup/*/name` lists `PNP0C0C:00` or
+   `LNXPWRBN:00`; its `event_count` grows when the button wakes the machine from suspend,
+   and `acpi_listen` shows `button/power` for a press while awake.
+8. The numbers and quirks D12's bounds need: how long after a press the hub appears
    (`udevadm monitor` timestamps); how long after boot and after resume until
    `ddcutil detect` finds each monitor; how long a monitor takes to settle after
    `setvcp 0x60` (poll `getvcp 0x60`); whether `getvcp 0x60` answers on an input the
@@ -384,7 +437,12 @@ binary. The configuration is read and written with `configparser`.
 - Waits and races (D12) run on an injected clock against a fake monitor that becomes
   reachable, settles, or ignores a write after a set number of polls, and a trigger device
   that leaves and returns mid-run. No test sleeps.
-- `install` and `uninstall` run against a temporary root and leave nothing behind.
+- `install` and `uninstall` run against a temporary root and leave nothing behind; the
+  power-button files come and go with the setting, and `install` refuses without acpid or
+  beside another acpid power-button handler.
+- Power-button wakes (D13) against a fake `/sys/class/wakeup`: a count that grew between
+  runs skips the desk check; an unchanged one, the first run after boot, another wakeup
+  source, or the setting off don't.
 - Real udev, real monitors and the USB switch need hardware: Phase 0, then a manual
   checklist per release.
 
@@ -397,6 +455,10 @@ binary. The configuration is read and written with `configparser`.
 - Daisy-chained (DisplayPort MST) monitors aren't covered: switching the nearer one can cut
   the farther one's signal.
 - In setup B, `wake` can't tell a wake you asked for from one you didn't (D10).
+- A power button whose wakeup source isn't `PNP0C0C` or `LNXPWRBN`, or that the kernel
+  doesn't count when it wakes the machine, wakes it without skipping the desk check (D13);
+  Phase 0 step 7 tells. A press while awake that acpid misses goes uncounted until the next
+  run, which then takes it as a wake.
 
 ## Out of scope
 

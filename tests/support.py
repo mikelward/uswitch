@@ -107,6 +107,16 @@ class FakeSysfs:
             with open(os.path.join(path, key), "w") as f:
                 f.write(value + "\n")
 
+    def press_power_button(self, name="PNP0C0C:00", source="wakeup0"):
+        """A wakeup source's event count, as the kernel counts a press."""
+        path = self.path(f"class/wakeup/{source}")
+        os.makedirs(path, exist_ok=True)
+        count_path = os.path.join(path, "event_count")
+        count = int(open(count_path).read()) + 1 if os.path.exists(count_path) else 0
+        for key, value in (("name", name), ("event_count", str(count))):
+            with open(os.path.join(path, key), "w") as f:
+                f.write(value + "\n")
+
     def remove_usb(self, port):
         shutil.rmtree(self.path(f"bus/usb/devices/{port}"))
 

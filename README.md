@@ -9,8 +9,10 @@ through `ddcutil`. Linux with systemd only; Dell monitors are the tested target.
 
 ## Before installing
 
-1. Install `ddcutil` (`apt install ddcutil`, or `dnf install ddcutil`) and
-   Python 3.10 or later.
+1. Install `ddcutil` and `acpid` (`apt install ddcutil acpid`, or
+   `dnf install ddcutil acpid`) and Python 3.10 or later. `acpid` is for the
+   power button; set `[power_button] enabled = no` in `/etc/uswitch.conf` to do
+   without it.
 2. On each monitor's on-screen menu, turn **DDC/CI** on and **Auto Select** and
    **USB-C Prioritization** off.
 3. Check by hand that the monitor accepts an input switch from an input it
@@ -38,6 +40,9 @@ Each machine learns only its own inputs.
 - With a USB switch, press its button: the machine it selects switches the
   monitors to itself.
 - With a monitor that is its own switch, wake the machine.
+- Press the machine's power button, to wake it or while it's awake: it always
+  switches the monitors to that machine, and no longer suspends it. In a
+  desktop session, set the desktop's power-button action to *Do nothing*.
 - To switch by hand, bind a keyboard shortcut to
   `systemctl start uswitch.service`. No password is needed for that one unit.
 

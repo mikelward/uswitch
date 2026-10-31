@@ -25,7 +25,14 @@ UDEV_RULE = "etc/udev/rules.d/90-uswitch.rules"
 UNIT = "etc/systemd/system/uswitch.service"
 POLKIT_RULE = "etc/polkit-1/rules.d/50-uswitch.rules"
 MODULES_LOAD = "etc/modules-load.d/uswitch.conf"
+POWER_UNIT = "etc/systemd/system/uswitch-power.service"
+ACPID_EVENT = "etc/acpi/events/uswitch"
+LOGIND_DROPIN = "etc/systemd/logind.conf.d/uswitch.conf"
+POWER_SNAPSHOT = "run/uswitch/power-button"
 UNIT_NAME = "uswitch.service"
+POWER_UNIT_NAME = "uswitch-power.service"
+POWER_WAKE_UNIT = "etc/systemd/system/uswitch-power-wake.service"
+POWER_WAKE_UNIT_NAME = "uswitch-power-wake.service"
 SLEEP_TARGETS = (
     "suspend.target",
     "hibernate.target",
@@ -50,6 +57,17 @@ INPUT_NAMES = {
 }
 
 DDCUTIL_PACKAGE_HINT = "install the ddcutil package (apt install ddcutil, or dnf install ddcutil)"
+ACPID_PACKAGE_HINT = (
+    "install the acpid package (apt install acpid, or dnf install acpid), "
+    "or set [power_button] enabled = no in /etc/uswitch.conf"
+)
+
+# Wakeup sources of the ACPI power button, in /sys/class/wakeup (D13).
+POWER_BUTTON_SOURCES = ("PNP0C0C", "LNXPWRBN")
+# What acpid reports for a power-button press, to find other handlers of it.
+ACPID_POWER_EVENT = "button/power PBTN 00000080 00000000"
+# acpid reads only event files with names like this.
+ACPID_FILE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 HEX4 = re.compile(r"[0-9a-f]{4}")
 PORT = re.compile(r"\d+-\d+(\.\d+)*")
@@ -453,6 +471,7 @@ class Desk:
 @dataclass
 class Config:
     wake: bool = True
+    power_button: bool = True
     desks: dict = field(default_factory=dict)
     monitors: list = field(default_factory=list)
 
@@ -474,6 +493,8 @@ def load_config(path):
     try:
         if parser.has_section("wake"):
             config.wake = parser.getboolean("wake", "enabled", fallback=True)
+        if parser.has_section("power_button"):
+            config.power_button = parser.getboolean("power_button", "enabled", fallback=True)
         for section in parser.sections():
             kind, _, name = section.partition(" ")
             values = parser[section]
@@ -502,7 +523,7 @@ def load_config(path):
                         input=int(values.get("input", ""), 0),
                     )
                 )
-            elif section != "wake":
+            elif section not in ("wake", "power_button"):
                 raise UswitchError(f"{path}: unknown section [{section}]")
     except ValueError as e:
         raise UswitchError(f"{path}: {e}")
@@ -523,10 +544,14 @@ def _clean(value):
 def config_text(config):
     lines = [
         "# Written by uswitch learn: rerun it rather than editing by hand (SPEC.md,",
-        "# Configuration). After changing [wake], rerun `sudo uswitch install`.",
+        "# Configuration). After changing [wake] or [power_button], rerun",
+        "# `sudo uswitch install`.",
         "",
         "[wake]",
         f"enabled = {'yes' if config.wake else 'no'}",
+        "",
+        "[power_button]",
+        f"enabled = {'yes' if config.power_button else 'no'}",
     ]
     for name in sorted(config.desks):
         desk = config.desks[name]
@@ -584,7 +609,7 @@ def replace_desk(config, name, usb, monitors):
     desks[name] = Desk(name, usb)
     monitors_by_desk = {m.desk for m in kept} | {name}
     desks = {n: d for n, d in desks.items() if n in monitors_by_desk}
-    return Config(config.wake, desks, kept + list(monitors))
+    return dataclasses.replace(config, desks=desks, monitors=kept + list(monitors))
 
 
 # --- Generated system files (D3, D4, D9, D10) ---------------------------------
@@ -657,6 +682,62 @@ polkit.addRule(function(action, subject) {{
 }});
 """
 
+def power_unit_text():
+    return f"""\
+# Written by uswitch install (SPEC.md D13). Started by acpid when the power
+# button is pressed; a press asks for the monitors, so it skips the desk check.
+[Unit]
+Description=Switch monitors to this machine on a power-button press
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/{PROGRAM} switch --force
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+"""
+
+
+def power_wake_unit_text():
+    targets = " ".join(SLEEP_TARGETS)
+    return f"""\
+# Written by uswitch install (SPEC.md D13). Hooked to boot and resume only
+# while wake is off, so a press that wakes the machine still switches; with
+# wake on, {UNIT_NAME} looks for the press itself. A boot is never a press:
+# its run only records the counts the first resume compares against.
+[Unit]
+Description=Switch monitors to this machine if its power button woke it
+After=systemd-modules-load.service multi-user.target {targets}
+
+[Service]
+Type=oneshot
+ExecStart=/{PROGRAM} switch --power-button-only
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target {targets}
+"""
+
+
+def acpid_event_text(systemctl):
+    return f"""\
+# Written by uswitch install (SPEC.md D13): the power button switches the
+# monitors to this machine instead of suspending or powering it off.
+event=button/power.*
+action={systemctl} --no-block start {POWER_UNIT_NAME}
+"""
+
+
+LOGIND_TEXT = """\
+# Written by uswitch install (SPEC.md D13): acpid handles the power button,
+# which switches the monitors here. A long press still powers off.
+[Login]
+HandlePowerKey=ignore
+"""
+
 MODULES_LOAD_TEXT = "# Written by uswitch install: ddcutil needs /dev/i2c-* (SPEC.md D4).\ni2c-dev\n"
 
 
@@ -714,6 +795,46 @@ def present(config, connectors):
     return pairs
 
 
+def power_button_counts(sysfs):
+    """{wakeup source: event count} for the power button's wakeup sources."""
+    counts = {}
+    base = os.path.join(sysfs, "class/wakeup")
+    try:
+        names = sorted(os.listdir(base))
+    except FileNotFoundError:
+        return counts
+    for entry in names:
+        name = _attr(os.path.join(base, entry), "name")
+        count = _attr(os.path.join(base, entry), "event_count")
+        if name and name.startswith(POWER_BUTTON_SOURCES) and count and count.isdigit():
+            counts[name] = int(count)
+    return counts
+
+
+def power_button_woke(ctx):
+    """Whether the power button was pressed since the last run looked (D13).
+
+    A press while awake starts its own run through acpid, which looks too, so
+    a count that grew between runs means a press that woke the machine. With
+    nothing recorded, after a boot say, it says no."""
+    counts = power_button_counts(ctx.sysfs)
+    if not counts:
+        return False
+    path = ctx.path(POWER_SNAPSHOT)
+    before = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                name, _, count = line.strip().rpartition(" ")
+                if name and count.isdigit():
+                    before[name] = int(count)
+    except FileNotFoundError:
+        pass
+    if counts != before:
+        write_file(path, "".join(f"{name} {count}\n" for name, count in counts.items()))
+    return any(name in before and count > before[name] for name, count in counts.items())
+
+
 def desk_check(desk, devices, force):
     """Whether a desk may switch now: a desk with a switch only while the
     switch points here (D11)."""
@@ -736,13 +857,20 @@ class MonitorRun:
         self.done, self.written, self.attempt_at, self.error = "", False, None, ""
 
 
-def switch(ctx, config, force=False, dry_run=False):
+def switch(ctx, config, force=False, dry_run=False, power_button_only=False):
     """Switch this desk's connected monitors to this machine. Returns the exit status."""
     clock, timing = ctx.clock, ctx.timing
     start = clock.now()
     if not config.monitors:
         ctx.say("No desk learned yet: run `sudo uswitch learn`.")
         return 0
+    woke = config.power_button and not dry_run and power_button_woke(ctx)
+    if power_button_only and not woke:
+        ctx.say("The power button didn't wake this machine: nothing to do.")
+        return 0
+    if woke and not force:
+        ctx.say("The power button woke this machine: switching whatever the desk check says.")
+        force = True
     while True:
         pairs = present(config, connected_monitors(ctx.sysfs))
         if pairs or dry_run or clock.now() - start >= timing.appear:
@@ -773,7 +901,22 @@ def switch(ctx, config, force=False, dry_run=False):
             generations[name] = now_here
         return pressed
 
+    def notice_power():
+        """Like a press of the switch, a power-button press starts every monitor
+        over, now past the desk check (D13). A suspend and resume during this
+        run folds the resume's start into it, so every pass looks, and records
+        each press even once forced, so none is left for a later run."""
+        nonlocal force
+        if not (config.power_button and power_button_woke(ctx)):
+            return False
+        force = True
+        for r in runs:
+            r.restart()
+        return True
+
     while True:
+        if notice_power():
+            ctx.say("The power button was pressed; checking the monitors again, whatever the desk check says.")
         now = clock.now()
         connectors = connected_monitors(ctx.sysfs)
         devices = usb_devices(ctx.sysfs) if usb_desks else {}
@@ -802,9 +945,14 @@ def switch(ctx, config, force=False, dry_run=False):
         if all(r.done for r in runs):
             # A press away and back during the steps above would be lost once this
             # run ends, folded into it by systemd: look once more before leaving.
-            if not usb_desks or not notice_presses(usb_devices(ctx.sysfs)):
+            pressed = bool(usb_desks) and notice_presses(usb_devices(ctx.sysfs))
+            powered = notice_power()
+            if not pressed and not powered:
                 break
-            ctx.say("The switch went away and came back; checking the monitors again.")
+            if pressed:
+                ctx.say("The switch went away and came back; checking the monitors again.")
+            if powered:
+                ctx.say("The power button was pressed; checking the monitors again, whatever the desk check says.")
             continue
         clock.sleep(timing.poll)
     status = 0
@@ -1073,10 +1221,97 @@ def _systemctl(ctx, *args):
 # --- Install and uninstall (D9) ----------------------------------------------
 
 
+def other_power_handlers(ctx):
+    """acpid event files besides uswitch's that act on the power button (D13)."""
+    events = ctx.path(os.path.dirname(ACPID_EVENT))
+    try:
+        names = sorted(os.listdir(events))
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        path = os.path.join(events, name)
+        if name == os.path.basename(ACPID_EVENT) or not ACPID_FILE_NAME.fullmatch(name) or not os.path.isfile(path):
+            continue
+        for line in _read(path).splitlines():
+            key, _, pattern = line.strip().partition("=")
+            if key.strip() != "event":
+                continue
+            try:
+                matches = re.search(pattern.strip(), ACPID_POWER_EVENT)
+            except re.error:
+                matches = True  # a pattern Python can't read: assume the worst
+            if matches:
+                found.append(f"/{os.path.relpath(path, ctx.root)}")
+                break
+    return found
+
+
+POWER_FILES = (POWER_UNIT, POWER_WAKE_UNIT, ACPID_EVENT, LOGIND_DROPIN)
+
+
+def _check_power_button(ctx):
+    """Refuse, before writing anything, what would make the power button unsafe (D13)."""
+    if ctx.which("acpid") is None:
+        raise UswitchError(f"acpid is not installed; {ACPID_PACKAGE_HINT}")
+    others = other_power_handlers(ctx)
+    if others:
+        raise UswitchError(
+            f"acpid also acts on the power button in {', '.join(others)}, and may power off "
+            "the machine; move it out of /etc/acpi/events, or set [power_button] enabled = no "
+            "in /etc/uswitch.conf, then rerun install"
+        )
+
+
+def _install_power_button(ctx, on):
+    """Hand the power button to acpid and uswitch, or take it back (D13)."""
+    if on:
+        write_file(ctx.path(ACPID_EVENT), acpid_event_text(systemctl_path(ctx)))
+        write_file(ctx.path(LOGIND_DROPIN), LOGIND_TEXT)
+        _systemctl(ctx, "enable", "acpid.service")
+        if ctx.live:
+            _check(ctx, ["systemctl", "restart", "acpid.service"])
+            _reload_logind(ctx)
+        return []
+    if os.path.exists(ctx.path(POWER_WAKE_UNIT)):
+        _systemctl(ctx, "disable", POWER_WAKE_UNIT_NAME)
+    removed = _remove(ctx, POWER_FILES)
+    if ctx.live and removed:
+        _check(ctx, ["systemctl", "daemon-reload"])
+        _check(ctx, ["systemctl", "try-restart", "acpid.service"])
+        _reload_logind(ctx)
+    return removed
+
+
+def _reload_logind(ctx):
+    """logind rereads HandlePowerKey on reload where it supports one; restarting
+    it can end sessions, so otherwise the change waits for the next boot."""
+    r = ctx.command(["systemctl", "show", "--property=CanReload", "--value", "systemd-logind.service"])
+    if r.returncode == 0 and r.stdout.strip() == "yes":
+        _check(ctx, ["systemctl", "reload", "systemd-logind.service"])
+    else:
+        ctx.say("The power-button setting for logind takes effect at the next boot.")
+
+
+def _remove(ctx, rels):
+    removed = []
+    for rel in rels:
+        try:
+            os.remove(ctx.path(rel))
+            removed.append(f"/{rel}")
+        except FileNotFoundError:
+            pass  # already gone: uninstall is idempotent
+    return removed
+
+
 def install(ctx):
     require_root(ctx)
     if ctx.which("ddcutil") is None:
         raise UswitchError(f"ddcutil is not installed; {DDCUTIL_PACKAGE_HINT}")
+    config = load_config(ctx.path(CONFIG))
+    power_button = config.power_button if config is not None else True
+    if power_button:
+        _check_power_button(ctx)
     program = ctx.path(PROGRAM)
     if not (os.path.exists(program) and os.path.samefile(ctx.self_path, program)):
         os.makedirs(os.path.dirname(program), exist_ok=True)
@@ -1084,15 +1319,25 @@ def install(ctx):
     write_file(ctx.path(UNIT), unit_text())
     write_file(ctx.path(POLKIT_RULE), POLKIT_TEXT)
     write_file(ctx.path(MODULES_LOAD), MODULES_LOAD_TEXT)
-    config = load_config(ctx.path(CONFIG))
+    if power_button:
+        write_file(ctx.path(POWER_UNIT), power_unit_text())
+        write_file(ctx.path(POWER_WAKE_UNIT), power_wake_unit_text())
     if ctx.live:
         _check(ctx, ["modprobe", "i2c-dev"])
         _check(ctx, ["systemctl", "daemon-reload"])
+    # After the reload, so the unit acpid starts is loaded by then.
+    _install_power_button(ctx, power_button)
     if config is not None:
         write_rules(ctx, config)
     wake = config.wake if config is not None else True
     _systemctl(ctx, "enable" if wake else "disable", UNIT_NAME)
-    ctx.say(f"Installed /{PROGRAM}, {UNIT_NAME} (wake {'on' if wake else 'off'}), its polkit rule and i2c-dev loading.")
+    if power_button:
+        # With wake on, the main unit's resume run looks for the press (D13).
+        _systemctl(ctx, "disable" if wake else "enable", POWER_WAKE_UNIT_NAME)
+    ctx.say(
+        f"Installed /{PROGRAM}, {UNIT_NAME} (wake {'on' if wake else 'off'}, "
+        f"power button {'on' if power_button else 'off'}), its polkit rule and i2c-dev loading."
+    )
     if config is None:
         ctx.say("No desk learned yet; running `uswitch learn`.")
         return learn(ctx)
@@ -1103,14 +1348,9 @@ def uninstall(ctx, purge=False):
     require_root(ctx)
     if os.path.exists(ctx.path(UNIT)):
         _systemctl(ctx, "disable", UNIT_NAME)
+    removed = _install_power_button(ctx, False)
     paths = [UDEV_RULE, UNIT, POLKIT_RULE, MODULES_LOAD, PROGRAM] + ([CONFIG] if purge else [])
-    removed = []
-    for rel in paths:
-        try:
-            os.remove(ctx.path(rel))
-            removed.append(f"/{rel}")
-        except FileNotFoundError:
-            pass  # already gone: uninstall is idempotent
+    removed += _remove(ctx, paths)
     if ctx.live:
         _check(ctx, ["systemctl", "daemon-reload"])
         _check(ctx, ["udevadm", "control", "--reload"])
@@ -1134,6 +1374,7 @@ def status(ctx):
     can_read = not ctx.live or ctx.euid == 0
     ddc = Ddc(ctx)
     ctx.say(f"wake: {'on' if config.wake else 'off'}")
+    ctx.say(f"power button: {'on' if config.power_button else 'off'}")
     for name in sorted(config.desks):
         desk = config.desks[name]
         here = any(m.label in pairs for m in config.monitors_of(name))
@@ -1170,6 +1411,7 @@ def parse_args(argv):
     p = sub.add_parser("switch", help="switch the connected monitors to this machine (D10)")
     p.add_argument("--dry-run", action="store_true", help="say what would change, and change nothing")
     p.add_argument("--force", action="store_true", help="skip the desk check (D11)")
+    p.add_argument("--power-button-only", action="store_true", help="switch only if the power button woke this machine (D13)")
     sub.add_parser("status", help="show desks, triggers and monitor inputs")
     return parser.parse_args(argv)
 
@@ -1187,7 +1429,7 @@ def main(argv=None, ctx=None):
         if args.command == "switch":
             require_root(ctx)
             config = load_config(ctx.path(CONFIG)) or Config()
-            return switch(ctx, config, force=args.force, dry_run=args.dry_run)
+            return switch(ctx, config, force=args.force, dry_run=args.dry_run, power_button_only=args.power_button_only)
         return status(ctx)
     except UswitchError as e:
         ctx.warn(str(e))
