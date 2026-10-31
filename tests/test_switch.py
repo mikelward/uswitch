@@ -188,6 +188,126 @@ class SwitchTest(Case):
         self.assertEqual(self.run_switch(self.desk(usb=HUB), force=True), 0)
         self.assertEqual(self.writes(), [DP1])
 
+    def test_a_power_button_wake_skips_the_desk_check(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button()  # seen by the run before the sleep
+        self.run_switch(config)
+        self.sysfs.press_power_button()  # the press that woke it from sleep
+        self.out.truncate(0)
+        self.assertEqual(self.run_switch(config), 0)
+        self.assertEqual(self.writes(), [DP1])
+        self.assertIn("power button woke", self.out.getvalue())
+
+    def test_power_button_only_switches_on_a_power_button_wake(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.sysfs.press_power_button()
+        self.assertEqual(self.run_switch(config, power_button_only=True), 0)
+        self.assertEqual(self.writes(), [DP1])
+
+    def test_power_button_only_at_boot_records_counts_for_the_first_resume(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button()
+        self.assertEqual(self.run_switch(config, power_button_only=True), 0)  # boot
+        self.assertEqual(self.writes(), [])
+        self.sysfs.press_power_button()
+        self.assertEqual(self.run_switch(config, power_button_only=True), 0)  # resume
+        self.assertEqual(self.writes(), [DP1])
+
+    def test_power_button_only_does_nothing_on_another_wake(self):
+        config = self.desk()  # setup B, where any other run would switch
+        self.sysfs.press_power_button()
+        self.run_switch(config, power_button_only=True)
+        self.assertEqual(self.run_switch(config, power_button_only=True), 0)
+        self.assertEqual(self.writes(), [])
+        self.assertIn("didn't wake", self.out.getvalue())
+
+    def test_a_power_button_wake_during_a_run_is_not_lost(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        # It suspends mid-run and the press wakes it; the resume folds into this run.
+        self.clock.at(self.clock.now() + 10, self.sysfs.press_power_button)
+        self.assertEqual(self.run_switch(config), 0)
+        self.assertEqual(self.writes(), [DP1])
+
+    def test_a_press_during_a_forced_run_is_not_left_for_the_next_run(self):
+        config = self.desk(usb=HUB, ignore_writes=100)  # keeps the forced run going
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.clock.at(self.clock.now() + 10, self.sysfs.press_power_button)
+        self.run_switch(config, force=True)
+        self.monitor.writes.clear()
+        self.monitor.ignore_writes = 0
+        self.assertEqual(self.run_switch(config), 0)  # the switch still points elsewhere
+        self.assertEqual(self.writes(), [])
+
+    def test_a_power_button_wake_during_a_run_rechecks_finished_monitors(self):
+        edid2 = make_edid(serial="BBB")
+        config = self.desk(usb=HUB, current=DP1)
+        self.sysfs.add_monitor("card0-DP-2", edid2, bus=5)
+        config.monitors.append(uswitch.monitor_from_edid(uswitch.parse_edid(edid2), "home", DP1))
+        self.runner.add(("--bus", "5"), FakeMonitor(HDMI1, ignore_writes=1000), DP1)  # keeps the run going
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.sysfs.add_usb("3-2", hub=True)
+
+        def sleep_and_wake():
+            self.monitor.current = HDMI1  # another machine took it while this one slept
+            self.sysfs.press_power_button()
+
+        self.clock.at(self.clock.now() + 10, sleep_and_wake)
+        self.run_switch(config)
+        self.assertEqual(self.monitor.current, DP1)
+
+    def test_a_press_during_the_last_pass_is_not_left_for_the_next_run(self):
+        config = self.desk(usb=HUB, current=DP1)
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.sysfs.add_usb("3-2", hub=True)
+
+        def pressed():
+            self.monitor.on_read = None
+            self.sysfs.press_power_button()
+
+        self.monitor.on_read = pressed
+        self.assertEqual(self.run_switch(config), 0)
+        self.sysfs.remove_usb("3-2")  # the switch moves away
+        self.monitor.current = HDMI1
+        self.assertEqual(self.run_switch(config), 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_other_wakes_keep_the_desk_check(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.assertEqual(self.run_switch(config), 0)  # a timer wake: no new press
+        self.assertEqual(self.writes(), [])
+
+    def test_a_first_run_after_boot_is_no_power_button_wake(self):
+        self.sysfs.press_power_button()
+        self.sysfs.press_power_button()
+        self.assertEqual(self.run_switch(self.desk(usb=HUB)), 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_power_button_off_ignores_its_presses(self):
+        config = self.desk(usb=HUB)
+        config.power_button = False
+        self.sysfs.press_power_button()
+        self.run_switch(config)
+        self.sysfs.press_power_button()
+        self.assertEqual(self.run_switch(config), 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_other_wakeup_sources_are_not_the_power_button(self):
+        config = self.desk(usb=HUB)
+        self.sysfs.press_power_button(name="PNP0C0D:00")  # the lid
+        self.run_switch(config)
+        self.sysfs.press_power_button(name="PNP0C0D:00")
+        self.assertEqual(self.run_switch(config), 0)
+        self.assertEqual(self.writes(), [])
+
     def test_waits_for_a_monitor_to_appear(self):
         edid = make_edid(serial="AAA")
         config = self.config({"home": None}, [("home", edid, DP1)])

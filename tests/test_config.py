@@ -12,9 +12,11 @@ class ConfigTest(Case):
             [("home", make_edid(serial="AAA"), 0x0F), ("work", make_edid(model="DELL U2724DE", serial=""), 0x1B)],
             wake=False,
         )
+        config.power_button = False
         self.write_config(config)
         loaded = uswitch.load_config(self.path(uswitch.CONFIG))
         self.assertFalse(loaded.wake)
+        self.assertFalse(loaded.power_button)
         self.assertEqual(loaded.desks["home"].usb, HUB)
         self.assertIsNone(loaded.desks["work"].usb)
         self.assertEqual([(m.desk, m.serial, m.input) for m in loaded.monitors], [("home", "AAA", 0x0F), ("work", "", 0x1B)])
