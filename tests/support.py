@@ -207,6 +207,9 @@ class Case(unittest.TestCase):
             stderr=self.err,
             timing=uswitch.Timing(),
             self_path=PROGRAM,
+            # Pinned, so the Linux tests test Linux even when run on a Mac;
+            # the Mac tests set their own.
+            platform=uswitch.Linux(),
         )
 
     def readline(self):

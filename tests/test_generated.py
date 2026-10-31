@@ -80,7 +80,7 @@ class DdcTest(Case):
 
 class CommandLineTest(Case):
     def test_needs_root_on_the_live_system(self):
-        ctx = uswitch.Context(euid=1000, stdout=io.StringIO(), stderr=io.StringIO())
+        ctx = uswitch.Context(euid=1000, stdout=io.StringIO(), stderr=io.StringIO(), platform=uswitch.Linux())
         self.assertEqual(uswitch.main(["switch"], ctx), 1)
         self.assertIn("needs root", ctx.stderr.getvalue())
 

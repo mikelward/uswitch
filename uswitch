@@ -7,6 +7,7 @@ SPEC.md is the contract. Decision numbers (D1, D2, ...) below refer to it.
 import argparse
 import configparser
 import dataclasses
+import fcntl
 import hashlib
 import os
 import re
@@ -55,6 +56,12 @@ INPUT_NAMES = {
     0x12: "HDMI-2",
     0x1B: "USB-C",
 }
+
+# On a Mac, everything is the user's own (D15).
+MAC_DIR = "Library/Application Support/mswitch"
+M1DDC_HINT = "install it with `brew install m1ddc` (Apple silicon only)"
+# m1ddc's EDID UUID, a Mac's identity for a monitor without a serial (D17).
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 DDCUTIL_PACKAGE_HINT = "install the ddcutil package (apt install ddcutil, or dnf install ddcutil)"
 ACPID_PACKAGE_HINT = (
@@ -149,7 +156,8 @@ class Context:
     stderr: object = sys.stderr
     timing: Timing = field(default_factory=Timing)
     self_path: str = os.path.abspath(__file__)
-    platform: object = field(default_factory=lambda: Linux())
+    home: str = field(default_factory=lambda: os.path.expanduser("~"))
+    platform: object = field(default_factory=lambda: Mac() if sys.platform == "darwin" else Linux())
 
     @property
     def live(self):
@@ -200,10 +208,16 @@ class Edid:
     model: str
     serial: str
     raw: bytes
+    uuid: str = ""  # on a Mac, m1ddc's EDID UUID in place of the bytes (D17)
 
     @property
     def hex(self):
         return self.raw.hex()
+
+    @property
+    def key(self):
+        """The whole EDID's identity, for a monitor without a serial (D6)."""
+        return self.raw.hex() if self.raw else self.uuid.lower()
 
 
 def _edid_text(block):
@@ -433,13 +447,13 @@ class Monitor:
     mfg: str
     model: str
     serial: str
-    edid: str  # the whole EDID in hex, the identity when there is no serial
+    edid: str  # the whole EDID in hex (a Mac's EDID UUID), the identity without a serial
     input: int
 
     def matches(self, edid):
         if self.serial:
             return (edid.mfg, edid.model, edid.serial) == (self.mfg, self.model, self.serial)
-        return edid.hex == self.edid
+        return edid.key == self.edid
 
     def same_monitor(self, other):
         if self.serial or other.serial:
@@ -450,7 +464,8 @@ class Monitor:
 def monitor_from_edid(edid, desk, value):
     # Without a serial the whole EDID is the identity, so the label hashes all of it:
     # two same-model monitors can differ in any byte, the manufacture week say.
-    ident = edid.serial or f"edid {hashlib.sha256(edid.raw).hexdigest()[:12]}"
+    whole = edid.raw or edid.uuid.lower().encode()
+    ident = edid.serial or f"edid {hashlib.sha256(whole).hexdigest()[:12]}"
     label = re.sub(r"[\[\]]", "", " ".join(s for s in (edid.model or edid.mfg, ident) if s))
     return Monitor(
         label=label,
@@ -458,7 +473,7 @@ def monitor_from_edid(edid, desk, value):
         mfg=edid.mfg,
         model=edid.model,
         serial=edid.serial,
-        edid="" if edid.serial else edid.hex,
+        edid="" if edid.serial else edid.key,
         input=value,
     )
 
@@ -531,8 +546,8 @@ def load_config(path):
     for m in config.monitors:
         if m.desk not in config.desks:
             raise UswitchError(f"{path}: [monitor {m.label}] names desk {m.desk!r}, which has no [desk] section")
-        if not m.serial and not re.fullmatch(r"[0-9a-f]{256}", m.edid):
-            raise UswitchError(f"{path}: [monitor {m.label}] needs a serial or its whole EDID")
+        if not m.serial and not (re.fullmatch(r"[0-9a-f]{256}", m.edid) or UUID.fullmatch(m.edid)):
+            raise UswitchError(f"{path}: [monitor {m.label}] needs a serial or its whole EDID (on a Mac, its EDID UUID)")
     return config
 
 
@@ -542,18 +557,19 @@ def _clean(value):
     return value
 
 
-def config_text(config):
+def config_text(config, platform=None):
+    platform = platform or Linux()
+    settings = "[wake] or [power_button]" if platform.power_button else "[wake]"
     lines = [
-        "# Written by uswitch learn: rerun it rather than editing by hand (SPEC.md,",
-        "# Configuration). After changing [wake] or [power_button], rerun",
-        "# `sudo uswitch install`.",
+        f"# Written by {platform.name} learn: rerun it rather than editing by hand (SPEC.md,",
+        f"# Configuration). After changing {settings}, rerun",
+        f"# `{platform.install_command}`.",
         "",
         "[wake]",
         f"enabled = {'yes' if config.wake else 'no'}",
-        "",
-        "[power_button]",
-        f"enabled = {'yes' if config.power_button else 'no'}",
     ]
+    if platform.power_button:
+        lines += ["", "[power_button]", f"enabled = {'yes' if config.power_button else 'no'}"]
     for name in sorted(config.desks):
         desk = config.desks[name]
         lines += ["", f"[desk {_clean(name)}]"]
@@ -793,11 +809,21 @@ class Linux:
 
     name = "uswitch"
     learn_command = "sudo uswitch learn"
+    install_command = "sudo uswitch install"
     ddc_check = "`ddcutil detect`"
-    written = f"/{CONFIG} and the udev rule"
+    power_button = True  # D13
+    usb = True  # USB switches (setup A)
 
     def config_path(self, ctx):
         return ctx.path(CONFIG)
+
+    def wrote(self, ctx):
+        return f"/{CONFIG} and the udev rule"
+
+    def serialize(self, ctx, force, run):
+        """systemd folds a start into a run already going (D12), so a switch
+        just runs."""
+        return run(force)
 
     def require_privilege(self, ctx):
         require_root(ctx)
@@ -826,6 +852,162 @@ class Linux:
 
     def uninstall(self, ctx, purge):
         return uninstall(ctx, purge)
+
+
+def parse_m1ddc_list(text):
+    """{system UUID: Edid} from `m1ddc display list detailed` (D17)."""
+    displays = []
+    for line in text.splitlines():
+        if re.match(r"\[\d+\] ", line):
+            displays.append({})
+            continue
+        m = re.match(r"\s*-\s*([^:]+):\s*(.*)$", line)
+        if m and displays:
+            value = m.group(2).strip()
+            # m1ddc prints an attribute macOS didn't give it as "(null)".
+            displays[-1][m.group(1).strip()] = "" if value == "(null)" else value
+    found = {}
+    for d in displays:
+        uuid = d.get("System UUID", "")
+        if not uuid:
+            continue
+        found[uuid] = Edid(
+            mfg=d.get("Manufacturer", ""),
+            model=d.get("Product name", ""),
+            serial=d.get("AN Serial", ""),
+            raw=b"",
+            uuid=d.get("EDID UUID", ""),
+        )
+    return found
+
+
+@dataclass(frozen=True)
+class MacDisplay:
+    """A connected monitor as m1ddc lists it, addressed by its system UUID (D17)."""
+
+    uuid: str
+    edid: Edid
+
+
+class M1ddc:
+    """DDC/CI through m1ddc, which a Mac addresses by system UUID (D14, D17)."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def run(self, args):
+        try:
+            return self.ctx.command(["m1ddc", *args])
+        except MissingCommand:
+            raise UswitchError(f"m1ddc is not installed; {M1DDC_HINT}")
+
+    def get_input(self, display):
+        """(value, None), or (None, why) when the monitor didn't answer."""
+        r = self.run(["display", display.uuid, "get", "input"])
+        if r.returncode != 0:
+            return None, r.message()
+        text = r.stdout.strip()
+        if not re.fullmatch(r"-?\d+", text) or int(text) < 0:
+            return None, f"unexpected m1ddc output: {text[:80]!r}"
+        return int(text) & 0xFF, None
+
+    def set_input(self, display, value):
+        """None, or why the write failed."""
+        r = self.run(["display", display.uuid, "set", "input", str(value)])
+        return None if r.returncode == 0 else r.message()
+
+
+def _touch(path):
+    os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+
+
+def _take(path):
+    """Whether `path` was there, removing it: a request taken exactly once."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+class Mac:
+    """Where mswitch finds monitors and DDC/CI on an Apple silicon Mac: m1ddc,
+    run as the logged-in user, with everything in the user's Library (D14,
+    D15, D17)."""
+
+    name = "mswitch"
+    learn_command = "mswitch learn"
+    install_command = "mswitch install"
+    ddc_check = "`m1ddc display list detailed`"
+    power_button = False  # macOS has no hook for it (D16)
+    usb = False  # USB switches arrive with ioreg (TODO.md)
+
+    def config_path(self, ctx):
+        return os.path.join(ctx.home, MAC_DIR, "mswitch.conf")
+
+    def wrote(self, ctx):
+        return self.config_path(ctx)
+
+    def require_privilege(self, ctx):
+        if ctx.live and ctx.euid == 0:
+            raise UswitchError("mswitch runs as you, not as root: run it without sudo (SPEC.md D15)")
+
+    def can_read(self, ctx):
+        return True
+
+    def monitors(self, ctx):
+        r = M1ddc(ctx).run(["display", "list", "detailed"])
+        if r.returncode != 0 and "No external display" not in r.stdout:
+            raise UswitchError(f"m1ddc display list failed: {r.message()}")
+        # With no external display, m1ddc says so and exits non-zero: none connected.
+        return [MacDisplay(uuid, edid) for uuid, edid in parse_m1ddc_list(r.stdout).items()]
+
+    def usb_devices(self, ctx):
+        return {}
+
+    def ddc(self, ctx):
+        return M1ddc(ctx)
+
+    def power_button_woke(self, ctx):
+        return False
+
+    def write_triggers(self, ctx, config):
+        pass  # the helper's trigger list arrives with it (TODO.md)
+
+    def serialize(self, ctx, force, run):
+        """One run at a time, and no trigger lost (D12, D15). Every start
+        records a request before trying the lock, so a start that finds a run
+        going can leave: the run that holds the lock runs again while a request
+        is pending, which brings back a monitor it had already finished with,
+        and looks once more after letting go, for a request that arrived in
+        between."""
+        directory = os.path.join(ctx.home, MAC_DIR)
+        os.makedirs(directory, exist_ok=True)
+        pending = os.path.join(directory, "switch.pending")
+        forced = os.path.join(directory, "switch.force")
+        if force:
+            _touch(forced)  # before the request, so whoever takes the request sees it
+        _touch(pending)
+        status = 0
+        while os.path.exists(pending):
+            with open(os.path.join(directory, "switch.lock"), "a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    ctx.say("A switch is already running; it takes this trigger too.")
+                    return status
+                try:
+                    while _take(pending):
+                        status = run(_take(forced))
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        return status
+
+    def install(self, ctx):
+        raise UswitchError("mswitch install isn't built yet (TODO.md); `mswitch learn` and `mswitch switch` work")
+
+    def uninstall(self, ctx, purge):
+        raise UswitchError("mswitch uninstall isn't built yet (TODO.md)")
 
 
 # --- Switching (D10, D11, D12) -----------------------------------------------
@@ -1201,8 +1383,13 @@ def learn(ctx, desk_name=None, usb_spec=None):
     if not DESK_NAME.fullmatch(desk_name):
         raise UswitchError("desk names are letters, digits, '.', '_' and '-'", code=2)
     devices = platform.usb_devices(ctx)
+    if usb_spec and not platform.usb:
+        raise UswitchError(f"{platform.name} can't use a USB switch yet (TODO.md)", code=2)
     if usb_spec:
         setup_a = True
+    elif not platform.usb:
+        setup_a = False
+        ctx.say("A USB switch isn't supported here yet, so this desk's monitor is its own switch (setup B).")
     else:
         while True:
             answer = ctx.ask("Does this desk have a USB switch (a), or is a monitor its own switch (b)?", "a").lower()
@@ -1236,9 +1423,9 @@ def learn(ctx, desk_name=None, usb_spec=None):
         pinned = " (port pinned: the ID alone isn't unique, or its serial isn't safe to match)" if usb.port else ""
         ctx.say(f"Trigger: {usb.describe()}{pinned}.")
     config = replace_desk(config, desk_name, usb, monitors)
-    write_file(config_path, config_text(config))
+    write_file(config_path, config_text(config, platform))
     platform.write_triggers(ctx, config)
-    ctx.say(f"Wrote desk {desk_name} to {platform.written}.")
+    ctx.say(f"Wrote desk {desk_name} to {platform.wrote(ctx)}.")
     ok = _prove(ctx, ddc, pairs, "switched back from another input.")
     return 0 if ok else 1
 
@@ -1424,7 +1611,8 @@ def status(ctx):
     can_read = platform.can_read(ctx)
     ddc = platform.ddc(ctx)
     ctx.say(f"wake: {'on' if config.wake else 'off'}")
-    ctx.say(f"power button: {'on' if config.power_button else 'off'}")
+    if platform.power_button:
+        ctx.say(f"power button: {'on' if config.power_button else 'off'}")
     for name in sorted(config.desks):
         desk = config.desks[name]
         here = any(m.label in pairs for m in config.monitors_of(name))
@@ -1449,8 +1637,8 @@ def status(ctx):
 # --- Command line -------------------------------------------------------------
 
 
-def parse_args(argv):
-    parser = argparse.ArgumentParser(prog="uswitch", description="Switch monitors to this machine over DDC/CI.")
+def parse_args(argv, prog="uswitch"):
+    parser = argparse.ArgumentParser(prog=prog, description="Switch monitors to this machine over DDC/CI.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("install", help="install, then learn if no desk is learned (D9)")
     p = sub.add_parser("uninstall", help="remove what install and learn wrote (D9)")
@@ -1467,8 +1655,8 @@ def parse_args(argv):
 
 
 def main(argv=None, ctx=None):
-    args = parse_args(sys.argv[1:] if argv is None else argv)
     ctx = ctx or Context()
+    args = parse_args(sys.argv[1:] if argv is None else argv, ctx.platform.name)
     try:
         if args.command == "install":
             return ctx.platform.install(ctx)
@@ -1479,7 +1667,13 @@ def main(argv=None, ctx=None):
         if args.command == "switch":
             ctx.platform.require_privilege(ctx)
             config = load_config(ctx.platform.config_path(ctx)) or Config()
-            return switch(ctx, config, force=args.force, dry_run=args.dry_run, power_button_only=args.power_button_only)
+            if args.dry_run:
+                return switch(ctx, config, force=args.force, dry_run=True)
+            return ctx.platform.serialize(
+                ctx,
+                args.force,
+                lambda force: switch(ctx, config, force=force, power_button_only=args.power_button_only),
+            )
         return status(ctx)
     except UswitchError as e:
         ctx.warn(str(e))

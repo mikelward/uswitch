@@ -3,6 +3,7 @@
 import os
 import unittest
 from dataclasses import dataclass
+from unittest import mock
 
 from support import Case, make_edid, uswitch
 
@@ -35,7 +36,9 @@ class FakePlatform:
     name = "fakeswitch"
     learn_command = "fakeswitch learn"
     ddc_check = "the fake's own check"
-    written = "the fake's configuration"
+    install_command = "fakeswitch install"
+    power_button = False
+    usb = True
 
     def __init__(self, config_path, connectors, ddc, devices=None):
         self.path = config_path
@@ -46,6 +49,12 @@ class FakePlatform:
 
     def config_path(self, ctx):
         return self.path
+
+    def wrote(self, ctx):
+        return "the fake's configuration"
+
+    def serialize(self, ctx, force, run):
+        return run(force)
 
     def require_privilege(self, ctx):
         pass
@@ -107,6 +116,22 @@ class PlatformTest(Case):
         self.assertIn("No desk learned yet: run `fakeswitch learn`.", self.out.getvalue())
         self.ctx.warn("something")
         self.assertEqual(self.err.getvalue(), "fakeswitch: something\n")
+
+
+class DefaultPlatformTest(unittest.TestCase):
+    def test_a_mac_runs_as_mswitch_and_anything_else_as_uswitch(self):
+        with mock.patch.object(uswitch.sys, "platform", "darwin"):
+            self.assertIsInstance(uswitch.Context().platform, uswitch.Mac)
+        with mock.patch.object(uswitch.sys, "platform", "linux"):
+            self.assertIsInstance(uswitch.Context().platform, uswitch.Linux)
+
+    def test_the_shared_fixture_tests_linux_whatever_it_runs_on(self):
+        # Codex on #13: run on a Mac, the Linux tests must still test Linux.
+        with mock.patch.object(uswitch.sys, "platform", "darwin"):
+            case = Case()
+            case.setUp()
+            self.addCleanup(case.doCleanups)
+        self.assertIsInstance(case.ctx.platform, uswitch.Linux)
 
 
 if __name__ == "__main__":
