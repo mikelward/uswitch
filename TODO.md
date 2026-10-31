@@ -2,11 +2,7 @@
 
 - **macOS** (`mswitch`, `SPEC.md` D14–D17). Built ahead of its Phase 0, since no Apple
   silicon Mac is on hand yet: those steps decide whether it works, before anyone relies
-  on it. One pull request each, in order:
-  1. The helper, `install` and `uninstall`: the `usb` and `wake` triggers. Until then
-     `mswitch install` says it isn't built, and a shortcut runs `mswitch switch` by
-     hand; `learn` already learns a USB switch, which that run checks.
-  2. `README.md` for macOS.
+  on it. Still to come: `README.md` for macOS.
   - **Tried** (2026-10-31): an Intel Mac on the Dell's HDMI input, then its USB-C input.
     `ddcctl` finds the monitor and its EDID, and `ioreg`'s `IODisplayEDID` parses with
     `parse_edid` as is, but no DDC/CI gets through on either port: reading `0x60` times

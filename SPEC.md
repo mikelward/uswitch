@@ -308,8 +308,9 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - **One helper.** Python's standard library can't subscribe to IOKit's device arrivals or
   to the wake notification, so a small Swift helper, which `install` compiles, runs while
   the user is logged in and starts `mswitch switch` on each trigger. It is uswitch's one
-  resident process (unlike D3); between triggers it only waits. `learn` rewrites its
-  trigger list, as it rewrites the udev rule on Linux.
+  resident process (unlike D3); between triggers it only waits. Its LaunchAgent passes it
+  the desks' trigger devices; `learn` rewrites them and restarts it, as it rewrites the
+  udev rule on Linux.
 - **One run at a time, no trigger lost.** `mswitch switch` records the trigger, then
   takes a lock; a start that finds it held leaves the trigger to the run in progress,
   as systemd folds a start into one (D12). The run holding the lock runs again while a
@@ -320,7 +321,8 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - **`usb`** (setup A): the configured trigger device arrives, matched as D1, with IOKit's
   location ID for the port pin.
 - **`wake`**: at login and on every wake from sleep, with the same desk check (D10, D11),
-  and the same `[wake] enabled = no` to turn it off.
+  and the same `[wake] enabled = no` to turn it off. Login is when the helper starts, so
+  `install` and `learn` restarting it count too.
 - **manual**: `mswitch switch` from a shortcut (Shortcuts.app, or a hotkey tool). It runs
   as the user, so no password rule is needed.
 - **No `power`.** macOS offers no hook for the power button while the Mac is awake, and no
@@ -384,8 +386,10 @@ On a Mac, everything is the user's own (D15):
 | `~/Library/Application Support/mswitch/mswitch.conf` | `learn` | Desks, monitors and inputs (*Configuration*). |
 | `~/Library/Application Support/mswitch/mswitch-helper` | `install` | The helper (D15), compiled from `mswitch-helper.swift`. |
 | `~/Library/LaunchAgents/com.github.mikelward.mswitch.plist` | `install`, `learn` | Runs the helper while the user is logged in, with the desks' trigger devices (D16). |
+| `~/Library/Logs/mswitch.log` | the helper | What it saw, and what each `mswitch switch` it ran printed. |
 
-`uninstall` removes them all except the configuration, which `--purge` removes too.
+`uninstall` removes them all except the configuration and the log, which `--purge`
+removes too.
 
 ## Configuration
 
@@ -500,6 +504,9 @@ On a Mac (D14–D17), with `m1ddc` from Homebrew:
    until `m1ddc` lists the monitor and the switch lands (D12).
 6. Log out, and run step 3 over `ssh` at the login window: whether anything can switch
    before login (D15).
+7. After `mswitch install`, press the switch away and back, then sleep and wake the Mac:
+   `~/Library/Logs/mswitch.log` shows the helper starting a run for each, which checks
+   that it sees the hub arrive and the wake (D16).
 
 ## Implementation
 
@@ -511,7 +518,8 @@ On a Mac, `mswitch` needs Homebrew's Python, since the one with the Command Line
 3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`,
 plus `ioreg` and `launchctl` from macOS. `install` builds the helper from
 `mswitch-helper.swift`, one file beside `uswitch`, with `swiftc` from the Command Line
-Tools; nothing else is compiled.
+Tools; nothing else is compiled. A LaunchAgent and a shortcut run with only the system's
+directories on `PATH`, so `mswitch` also looks for `m1ddc` where Homebrew installs it.
 
 ## Testing
 

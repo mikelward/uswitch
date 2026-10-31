@@ -61,6 +61,14 @@ INPUT_NAMES = {
 
 # On a Mac, everything is the user's own (D15).
 MAC_DIR = "Library/Application Support/mswitch"
+MAC_PROGRAM = ".local/bin/mswitch"
+MAC_HELPER = f"{MAC_DIR}/mswitch-helper"
+MAC_AGENT = "Library/LaunchAgents/com.github.mikelward.mswitch.plist"
+MAC_AGENT_LABEL = "com.github.mikelward.mswitch"
+MAC_LOG = "Library/Logs/mswitch.log"
+HELPER_SOURCE = "mswitch-helper.swift"
+# A LaunchAgent and a shortcut run with only the system's directories on PATH.
+HOMEBREW_BINS = ("/opt/homebrew/bin", "/usr/local/bin")
 M1DDC_HINT = "install it with `brew install m1ddc` (Apple silicon only)"
 # m1ddc's EDID UUID, a Mac's identity for a monitor without a serial (D17).
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -117,6 +125,7 @@ class Timing:
     learn_return_grace: float = 5.0  # learn: after the first returns, for the rest
     learn_away: float = 30.0  # learn: for each monitor to leave this machine's input
     command: float = 20.0  # one ddcutil, systemctl, udevadm or modprobe call
+    build: float = 300.0  # install: compiling the Mac's helper, a cold Swift build
 
 
 class Clock:
@@ -948,6 +957,19 @@ class MacDisplay:
     edid: Edid
 
 
+def find_command(ctx, name):
+    """`name` if it's on PATH, else its path where Homebrew installs it, else
+    None: the helper's LaunchAgent and a shortcut run with only the system's
+    directories on PATH (D15)."""
+    if ctx.which(name):
+        return name
+    for directory in HOMEBREW_BINS:
+        path = os.path.join(directory, name)
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
 class M1ddc:
     """DDC/CI through m1ddc, which a Mac addresses by system UUID (D14, D17)."""
 
@@ -956,7 +978,7 @@ class M1ddc:
 
     def run(self, args):
         try:
-            return self.ctx.command(["m1ddc", *args])
+            return self.ctx.command([find_command(self.ctx, "m1ddc") or "m1ddc", *args])
         except MissingCommand:
             raise UswitchError(f"m1ddc is not installed; {M1DDC_HINT}")
 
@@ -974,6 +996,32 @@ class M1ddc:
         """None, or why the write failed."""
         r = self.run(["display", display.uuid, "set", "input", str(value)])
         return None if r.returncode == 0 else r.message()
+
+
+def launch_agent_text(helper, program, log, config):
+    """The LaunchAgent running the helper (D15, D16): the program it starts, and
+    the triggers it watches for, as the helper's own arguments."""
+    args = [helper, program]
+    if config is None or config.wake:
+        args.append("--wake")
+    for name, desk in sorted(config.desks.items()) if config else []:
+        usb = desk.usb
+        if usb is None:
+            continue
+        if usb.port and not LOCATION.fullmatch(usb.port):
+            raise UswitchError(f"desk {name}: usb_port {usb.port} isn't a Mac's location ID; rerun `mswitch learn` at that desk")
+        args += ["--usb", usb.vendor, usb.product, usb.serial, usb.port]
+    agent = {
+        "Label": MAC_AGENT_LABEL,
+        "ProgramArguments": args,
+        "LimitLoadToSessionType": "Aqua",  # the window server's session, where m1ddc finds monitors (D15)
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+    text = plistlib.dumps(agent, sort_keys=False).decode()
+    return text.replace("<plist ", "<!-- Written by mswitch install and learn (SPEC.md D15, D16). -->\n<plist ", 1)
 
 
 def _touch(path):
@@ -1033,7 +1081,24 @@ class Mac:
         return False
 
     def write_triggers(self, ctx, config):
-        pass  # the helper's trigger list arrives with it (TODO.md)
+        if not os.path.exists(os.path.join(ctx.home, MAC_HELPER)):
+            ctx.say("Nothing starts mswitch on its own until `mswitch install` sets up its helper.")
+            return
+        self._load_agent(ctx, config)
+
+    def _load_agent(self, ctx, config):
+        """Writes the helper's LaunchAgent and restarts it, so it watches for the
+        desks' switches as they are now (D15)."""
+        home = ctx.home
+        agent = os.path.join(home, MAC_AGENT)
+        text = launch_agent_text(
+            os.path.join(home, MAC_HELPER), os.path.join(home, MAC_PROGRAM), os.path.join(home, MAC_LOG), config
+        )
+        write_file(agent, text)
+        domain = f"gui/{ctx.euid}"
+        # Its result doesn't matter: on a first install there's no agent to stop.
+        ctx.command(["launchctl", "bootout", f"{domain}/{MAC_AGENT_LABEL}"])
+        _check(ctx, ["launchctl", "bootstrap", domain, agent])
 
     def serialize(self, ctx, force, run):
         """One run at a time, and no trigger lost (D12, D15). Every start
@@ -1065,10 +1130,81 @@ class Mac:
         return status
 
     def install(self, ctx):
-        raise UswitchError("mswitch install isn't built yet (TODO.md); `mswitch learn` and `mswitch switch` work")
+        """The program, the helper compiled for this Mac, and the LaunchAgent
+        that runs it (D9, D15)."""
+        self.require_privilege(ctx)
+        if sys.version_info < (3, 10):
+            raise UswitchError("mswitch needs Python 3.10 or later; run install with Homebrew's (`brew install python`)")
+        if find_command(ctx, "m1ddc") is None:
+            raise UswitchError(f"m1ddc is not installed; {M1DDC_HINT}")
+        if ctx.which("swiftc") is None:
+            raise UswitchError("swiftc is not installed; install Apple's Command Line Tools with `xcode-select --install`")
+        source = os.path.join(os.path.dirname(os.path.realpath(ctx.self_path)), HELPER_SOURCE)
+        if not os.path.exists(source):
+            raise UswitchError(f"{HELPER_SOURCE} isn't beside {ctx.self_path}; run install from a uswitch checkout")
+        helper = os.path.join(ctx.home, MAC_HELPER)
+        os.makedirs(os.path.dirname(helper), exist_ok=True)
+        # Built beside it and renamed over it, so a helper already running
+        # keeps its own file until launchd restarts it.
+        built = f"{helper}.new"
+        r = ctx.run(["swiftc", "-O", "-o", built, source], ctx.timing.build)
+        if r.returncode != 0:
+            if os.path.exists(built):
+                os.remove(built)
+            raise UswitchError(f"building the helper failed: {r.message()}")
+        os.replace(built, helper)
+        program = os.path.join(ctx.home, MAC_PROGRAM)
+        lines = _read(ctx.self_path).split("\n", 1)
+        # The interpreter running install, which is 3.10 or later, not the
+        # Command Line Tools' python3 that /usr/bin/env would find (D15).
+        write_file(program, f"#!{sys.executable}\n{lines[1] if len(lines) > 1 else ''}", 0o755)
+        config = load_config(self.config_path(ctx))
+        self._load_agent(ctx, config)
+        wake = config is None or config.wake
+        ctx.say(
+            f"Installed {program} and its helper, which runs `mswitch switch` when a desk's USB switch arrives"
+            + (", at login and on wake." if wake else "; wake is off.")
+        )
+        if config is None:
+            ctx.say("No desk learned yet; running `mswitch learn`.")
+            return learn(ctx)
+        return 0
 
     def uninstall(self, ctx, purge):
-        raise UswitchError("mswitch uninstall isn't built yet (TODO.md)")
+        self.require_privilege(ctx)
+        home = ctx.home
+        agent = os.path.join(home, MAC_AGENT)
+        if os.path.exists(agent):
+            # Its result doesn't matter: an agent that isn't running has nothing to stop.
+            ctx.command(["launchctl", "bootout", f"gui/{ctx.euid}/{MAC_AGENT_LABEL}"])
+        config = self.config_path(ctx)
+        paths = [agent, os.path.join(home, MAC_HELPER), os.path.join(home, MAC_PROGRAM)]
+        if purge:
+            paths += [config, os.path.join(home, MAC_LOG)]
+        removed = []
+        for path in paths:
+            try:
+                os.remove(path)
+                removed.append(path)
+            except FileNotFoundError:
+                pass  # already gone: uninstall is idempotent
+        if purge:
+            directory = os.path.join(home, MAC_DIR)
+            for name in ("switch.lock", "switch.pending", "switch.force"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                except FileNotFoundError:
+                    pass  # no switch ran, or none was pending
+            try:
+                os.rmdir(directory)
+            except FileNotFoundError:
+                pass  # never created
+            except OSError as e:
+                ctx.warn(f"kept {directory}: {e.strerror}")  # something else lives there
+        ctx.say("Removed " + (", ".join(removed) if removed else "nothing; mswitch wasn't installed") + ".")
+        if not purge and os.path.exists(config):
+            ctx.say(f"Kept {config}; `mswitch uninstall --purge` removes it too.")
+        return 0
 
 
 # --- Switching (D10, D11, D12) -----------------------------------------------

@@ -1,0 +1,35 @@
+# Builds mswitch's helper on macOS, as `mswitch install` does (SPEC.md D15,
+# Testing). Only for changes to the helper or this file: the Python suite in
+# ci.yml covers everything else on Linux, faking the Mac's commands.
+#
+# Not a required check: a workflow filtered out by `paths:` reports no check
+# run at all, so requiring it would hold every other pull request forever.
+#
+# Cost and reliability: macOS runners are free for a public repository, and
+# the build takes about a minute; nothing here touches the network beyond the
+# checkout.
+name: helper
+on:
+  push:
+    branches: [main]
+    paths: [mswitch-helper.swift, .github/workflows/helper.yml]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [mswitch-helper.swift, .github/workflows/helper.yml]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build it as install does
+        run: swiftc -O -o mswitch-helper mswitch-helper.swift
+      - name: It refuses arguments it doesn't know
+        run: |
+          status=0
+          ./mswitch-helper --nonsense || status=$?
+          test "$status" -eq 2
