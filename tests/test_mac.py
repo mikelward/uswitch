@@ -7,10 +7,11 @@ shaped as a real Mac printed its USB plane."""
 import fcntl
 import os
 import plistlib
+import sys
 import unittest
 from unittest import mock
 
-from support import Case, uswitch
+from support import Case, read, uswitch
 
 DP1, HDMI1, USBC = 0x0F, 0x11, 0x1B
 HIGH, FULL, SUPER = 2, 1, 3  # IOKit's "Device Speed"
@@ -56,7 +57,7 @@ class FakeM1ddc:
 
     def __call__(self, argv, timeout):
         self.calls.append(list(argv))
-        if argv[0] != "m1ddc":
+        if os.path.basename(argv[0]) != "m1ddc":
             return uswitch.Result(0, "", "")
         if self.missing:
             raise uswitch.MissingCommand("m1ddc not found")
@@ -81,7 +82,7 @@ class FakeM1ddc:
         return uswitch.Result(0, f"Writing {argv[5]}\n", "")
 
     def m1ddc(self):
-        return [c for c in self.calls if c[0] == "m1ddc"]
+        return [c for c in self.calls if os.path.basename(c[0]) == "m1ddc"]
 
 
 def parent(location):
@@ -164,10 +165,36 @@ class MacCase(Case):
         super().setUp()
         self.m1ddc = FakeM1ddc(self.clock)
         self.ioreg = FakeIoreg()
-        self.ctx.run = lambda argv, timeout: (self.ioreg if argv[0] == "ioreg" else self.m1ddc)(argv, timeout)
+        self.calls = []  # every other command: swiftc, launchctl
+        self.failing = {}  # command name -> its error
+        self.ctx.run = self.command
         self.ctx.platform = uswitch.Mac()
         self.ctx.home = os.path.join(self.tmp, "home")
         self.ctx.sysfs = os.path.join(self.tmp, "no-sysfs")
+        # Never the real Homebrew, whatever Mac runs the tests.
+        self.homebrew = os.path.join(self.tmp, "homebrew")
+        os.makedirs(self.homebrew)
+        patcher = mock.patch.object(uswitch, "HOMEBREW_BINS", (self.homebrew,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def command(self, argv, timeout):
+        name = os.path.basename(argv[0])
+        if name == "ioreg":
+            return self.ioreg(argv, timeout)
+        if name == "m1ddc":
+            return self.m1ddc(argv, timeout)
+        self.calls.append(list(argv))
+        if name == "swiftc":
+            # Written even by a build that fails, so a test sees install clean up after one.
+            with open(argv[argv.index("-o") + 1], "w") as f:
+                f.write("a compiled helper\n")
+        if name in self.failing:
+            return uswitch.Result(1, "", self.failing[name])
+        return uswitch.Result(0, "", "")
+
+    def home(self, rel):
+        return os.path.join(self.ctx.home, rel)
 
     def conf(self):
         return os.path.join(self.ctx.home, "Library/Application Support/mswitch/mswitch.conf")
@@ -284,7 +311,7 @@ class MacSwitchTest(MacCase):
 
     def test_a_monitor_without_a_serial_is_known_by_its_edid_uuid(self):
         self.learned(uuid=NO_SERIAL, serial="(null)", edid_uuid=NO_SERIAL.upper())
-        self.assertIn(f"edid = {NO_SERIAL}", open(self.conf()).read())
+        self.assertIn(f"edid = {NO_SERIAL}", read(self.conf()))
         self.assertEqual(uswitch.main(["switch"], self.ctx), 0)
         self.assertEqual(self.m1ddc.displays[NO_SERIAL][4], DP1)
 
@@ -424,7 +451,7 @@ class MacLearnTest(MacCase):
         self.m1ddc.add(BUILT_IN, name="Color LCD", mfg="APP", serial="(null)", answers=False)
         self.answers = ["home", "b", ""]
         self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
-        text = open(self.conf()).read()
+        text = read(self.conf())
         self.assertIn("# Written by mswitch learn", text)
         self.assertNotIn("[power_button]", text)
         config = uswitch.load_config(self.conf())
@@ -478,7 +505,7 @@ class MacLearnTest(MacCase):
         self.press()
         self.answers = ["home", "a", ""]
         self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
-        self.assertIn("usb_port = 0x14500000", open(self.conf()).read())
+        self.assertIn("usb_port = 0x14500000", read(self.conf()))
         config = uswitch.load_config(self.conf())
         self.assertEqual(config.desks["home"].usb, uswitch.UsbTrigger("0bda", "5409", "", "0x14500000"))
 
@@ -497,6 +524,189 @@ class MacLearnTest(MacCase):
         self.assertIn("wake: on", out)
         self.assertNotIn("power button", out)
         self.assertIn("showing 0x11 (HDMI-1)", out)
+
+
+class LaunchAgentTest(unittest.TestCase):
+    def agent(self, config):
+        text = uswitch.launch_agent_text("/h/helper", "/h/mswitch", "/h/mswitch.log", config)
+        self.assertIn("<!-- Written by mswitch install and learn", text)
+        return plistlib.loads(text.encode())
+
+    def test_runs_the_helper_with_the_program_and_each_desks_switch(self):
+        config = uswitch.Config()
+        config.desks["work"] = uswitch.Desk("work")
+        config.desks["home"] = uswitch.Desk("home", uswitch.UsbTrigger("0bda", "5409", "SERIAL1", "0x14500000"))
+        config.desks["lab"] = uswitch.Desk("lab", uswitch.UsbTrigger("05e3", "0610"))
+        agent = self.agent(config)
+        self.assertEqual(
+            agent["ProgramArguments"],
+            ["/h/helper", "/h/mswitch", "--wake",
+             "--usb", "0bda", "5409", "SERIAL1", "0x14500000",
+             "--usb", "05e3", "0610", "", ""],
+        )
+        self.assertEqual(agent["Label"], "com.github.mikelward.mswitch")
+        self.assertEqual((agent["RunAtLoad"], agent["KeepAlive"]), (True, True))
+        self.assertEqual(agent["StandardErrorPath"], "/h/mswitch.log")
+
+    def test_wake_off_drops_the_wake_trigger(self):
+        config = uswitch.Config(wake=False)
+        self.assertEqual(self.agent(config)["ProgramArguments"], ["/h/helper", "/h/mswitch"])
+
+    def test_nothing_learned_watches_for_wakes(self):
+        self.assertEqual(self.agent(None)["ProgramArguments"], ["/h/helper", "/h/mswitch", "--wake"])
+
+    def test_a_linux_port_pin_is_refused(self):
+        config = uswitch.Config()
+        config.desks["home"] = uswitch.Desk("home", uswitch.UsbTrigger("0bda", "5409", port="3-2"))
+        with self.assertRaises(uswitch.UswitchError) as e:
+            self.agent(config)
+        self.assertIn("isn't a Mac's location ID", str(e.exception))
+
+
+class MacInstallTest(MacCase):
+    def setUp(self):
+        super().setUp()
+        self.agent = self.home("Library/LaunchAgents/com.github.mikelward.mswitch.plist")
+        self.helper = self.home("Library/Application Support/mswitch/mswitch-helper")
+        self.program = self.home(".local/bin/mswitch")
+        self.ctx.euid = 501
+
+    def arguments(self):
+        with open(self.agent, "rb") as f:
+            return plistlib.load(f)["ProgramArguments"]
+
+    def test_builds_the_helper_and_loads_its_agent_then_learns(self):
+        self.m1ddc.add(DELL, current=DP1)
+        self.clock.at(1.0, lambda: self.m1ddc.displays[DELL].__setitem__(4, HDMI1))  # its buttons
+        self.answers = ["home", "b", ""]
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        source = os.path.join(os.path.dirname(uswitch.__file__), "mswitch-helper.swift")
+        self.assertEqual(self.calls[0], ["swiftc", "-O", "-o", self.helper + ".new", source])
+        self.assertTrue(os.path.exists(source))
+        self.assertEqual(read(self.helper), "a compiled helper\n")
+        self.assertFalse(os.path.exists(self.helper + ".new"))
+        with open(self.program) as f, open(uswitch.__file__) as g:
+            program, original = f.read(), g.read()
+        self.assertEqual(program.split("\n", 1), [f"#!{sys.executable}", original.split("\n", 1)[1]])
+        self.assertTrue(os.access(self.program, os.X_OK))
+        self.assertEqual(self.arguments(), [self.helper, self.program, "--wake"])
+        self.assertEqual(
+            self.calls[1:],
+            [["launchctl", "bootout", "gui/501/com.github.mikelward.mswitch"],
+             ["launchctl", "bootstrap", "gui/501", self.agent]] * 2,  # install, then learn
+        )
+        self.assertIn("No desk learned yet; running `mswitch learn`.", self.out.getvalue())
+        self.assertIsNotNone(uswitch.load_config(self.conf()))
+
+    def test_reinstalling_keeps_the_desks_and_their_switches(self):
+        self.learned(usb=uswitch.UsbTrigger("0bda", "5409", port="0x14500000"))
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        self.assertEqual(self.arguments(), [self.helper, self.program, "--wake", "--usb", "0bda", "5409", "", "0x14500000"])
+        self.assertIn("at login and on wake", self.out.getvalue())
+        self.assertNotIn("running `mswitch learn`", self.out.getvalue())
+
+    def test_learn_points_an_installed_helper_at_the_new_switch(self):
+        self.learned()
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        self.calls.clear()
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, "USB2.1 Hub", hub=True)
+        self.clock.at(1.0, lambda: self.m1ddc.displays[DELL].__setitem__(4, HDMI1))  # its buttons
+        self.m1ddc.displays[DELL][4] = DP1
+        self.answers = [""]
+        self.assertEqual(uswitch.main(["learn", "--desk", "home", "--usb", "0bda:5409"], self.ctx), 0)
+        self.assertEqual(self.arguments()[3:], ["--usb", "0bda", "5409", "", ""])
+        self.assertEqual([c[1] for c in self.calls], ["bootout", "bootstrap"])
+
+    def test_learn_without_the_helper_says_install_sets_it_up(self):
+        self.m1ddc.add(DELL, current=DP1)
+        self.answers = ["home", "b", ""]
+        self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
+        self.assertIn("until `mswitch install` sets up its helper", self.out.getvalue())
+        self.assertFalse(os.path.exists(self.agent))
+        self.assertEqual(self.calls, [])
+
+    def test_wake_off_is_said_and_left_out(self):
+        config = self.learned()
+        config.wake = False
+        uswitch.write_file(self.conf(), uswitch.config_text(config, self.ctx.platform))
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        self.assertEqual(self.arguments(), [self.helper, self.program])
+        self.assertIn("wake is off", self.out.getvalue())
+
+    def test_finds_m1ddc_where_homebrew_puts_it(self):
+        # A LaunchAgent's PATH has only the system's directories.
+        self.runner.missing.add("m1ddc")
+        m1ddc = os.path.join(self.homebrew, "m1ddc")
+        uswitch.write_file(m1ddc, "", 0o755)
+        self.learned()
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 0)
+        self.assertIn([m1ddc, "display", DELL, "set", "input", "15"], self.m1ddc.m1ddc())
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+
+    def test_refuses_without_m1ddc(self):
+        self.runner.missing.add("m1ddc")
+        self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("m1ddc is not installed; install it with `brew install m1ddc`", self.err.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def test_refuses_without_swiftc(self):
+        self.runner.missing.add("swiftc")
+        self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("xcode-select --install", self.err.getvalue())
+        self.assertFalse(os.path.exists(self.program))
+
+    def test_refuses_an_old_python(self):
+        with mock.patch.object(uswitch.sys, "version_info", (3, 9, 6)):
+            self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("needs Python 3.10 or later", self.err.getvalue())
+
+    def test_a_failed_build_installs_nothing(self):
+        self.failing["swiftc"] = "mswitch-helper.swift:1:1: error: something"
+        self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("building the helper failed: mswitch-helper.swift:1:1: error: something", self.err.getvalue())
+        self.assertFalse(os.path.exists(self.program))
+        self.assertFalse(os.path.exists(self.agent))
+        self.assertEqual(os.listdir(os.path.dirname(self.helper)), [])
+
+    def test_a_failed_load_is_reported(self):
+        self.learned()
+        self.failing["launchctl"] = "Bootstrap failed: 5: Input/output error"
+        self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("launchctl bootstrap gui/501", self.err.getvalue())
+        self.assertIn("Bootstrap failed: 5", self.err.getvalue())
+
+    def test_refuses_to_install_as_root(self):
+        self.ctx.root = "/"  # live
+        self.ctx.euid = 0
+        self.assertEqual(uswitch.main(["install"], self.ctx), 1)
+        self.assertIn("runs as you, not as root", self.err.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def test_uninstall_removes_everything_but_the_configuration(self):
+        self.learned()
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        self.calls.clear()
+        self.assertEqual(uswitch.main(["uninstall"], self.ctx), 0)
+        self.assertEqual(self.calls, [["launchctl", "bootout", "gui/501/com.github.mikelward.mswitch"]])
+        for path in (self.agent, self.helper, self.program):
+            self.assertFalse(os.path.exists(path), path)
+        self.assertTrue(os.path.exists(self.conf()))
+        self.assertIn("`mswitch uninstall --purge` removes it too", self.out.getvalue())
+
+    def test_uninstall_purge_leaves_nothing_behind(self):
+        self.learned()
+        self.assertEqual(uswitch.main(["install"], self.ctx), 0)
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 0)  # leaves its lock
+        uswitch.write_file(self.home("Library/Logs/mswitch.log"), "a run\n")
+        self.assertEqual(uswitch.main(["uninstall", "--purge"], self.ctx), 0)
+        left = [os.path.join(d, f) for d, _, files in os.walk(self.ctx.home) for f in files]
+        self.assertEqual(left, [])
+        self.assertFalse(os.path.exists(os.path.dirname(self.conf())))
+
+    def test_uninstall_with_nothing_installed_says_so(self):
+        self.assertEqual(uswitch.main(["uninstall"], self.ctx), 0)
+        self.assertIn("Removed nothing; mswitch wasn't installed.", self.out.getvalue())
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
