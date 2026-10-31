@@ -38,7 +38,6 @@ class FakePlatform:
     ddc_check = "the fake's own check"
     install_command = "fakeswitch install"
     power_button = False
-    usb = True
 
     def __init__(self, config_path, connectors, ddc, devices=None):
         self.path = config_path

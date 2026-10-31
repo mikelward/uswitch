@@ -1,16 +1,19 @@
-"""The Mac platform: m1ddc's monitors and DDC/CI, the user's Library, the lock
-(SPEC.md D14-D17). m1ddc is faked at the command boundary, answering as its
-source does: errors on stdout, a non-zero exit, and "(null)" for an attribute
-macOS didn't give it."""
+"""The Mac platform: m1ddc's monitors and DDC/CI, ioreg's USB devices, the
+user's Library, the lock (SPEC.md D14-D17). m1ddc is faked at the command
+boundary, answering as its source does: errors on stdout, a non-zero exit, and
+"(null)" for an attribute macOS didn't give it. ioreg is faked the same way,
+shaped as a real Mac printed its USB plane."""
 
 import fcntl
 import os
+import plistlib
 import unittest
 from unittest import mock
 
 from support import Case, uswitch
 
 DP1, HDMI1, USBC = 0x0F, 0x11, 0x1B
+HIGH, FULL, SUPER = 2, 1, 3  # IOKit's "Device Speed"
 DELL = "11111111-2222-3333-4444-555555555555"
 NO_SERIAL = "66666666-7777-8888-9999-aaaaaaaaaaaa"
 BUILT_IN = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -81,11 +84,87 @@ class FakeM1ddc:
         return [c for c in self.calls if c[0] == "m1ddc"]
 
 
+def parent(location):
+    """The hub a location ID hangs from: its last hub tier cleared."""
+    for shift in range(0, 24, 4):
+        if location >> shift & 0xF:
+            return location & ~(0xF << shift)
+    return None
+
+
+class FakeIoreg:
+    """`ioreg -a -l -p IOUSB`: a root hub per bus, and each device under the hub
+    its location ID names, with a new session ID every time it's plugged in."""
+
+    def __init__(self):
+        self.devices = {}  # location ID -> its properties
+        self.session = 1000
+        self.calls = 0
+        self.output = None  # stands in for the whole output when set
+
+    def plug(self, location, vendor, product, name="", serial="", hub=False, speed=HIGH, maker="Generic"):
+        self.session += 1
+        entry = {
+            "idVendor": vendor,
+            "idProduct": product,
+            "locationID": location,
+            "sessionID": self.session,
+            "bDeviceClass": 9 if hub else 0,
+            "Device Speed": speed,
+            "USB Product Name": name,
+            "USB Vendor Name": maker,
+            "IOObjectClass": "AppleUSBDevice",
+        }
+        if serial:
+            entry["USB Serial Number"] = serial
+        self.devices[location] = entry
+
+    def unplug(self, location):
+        del self.devices[location]
+
+    def tree(self):
+        def under(hub):
+            found = []
+            for location in sorted(self.devices):
+                if parent(location) == hub:
+                    entry = dict(self.devices[location])
+                    if location & 0x80000000:  # as a T2 Mac's internal bus reports it
+                        entry["locationID"] = location | 0xFFFFFFFF00000000
+                    children = under(location)
+                    if children:
+                        entry["IORegistryEntryChildren"] = children
+                    found.append(entry)
+            return found
+
+        roots = []
+        for bus in sorted({location >> 24 for location in self.devices}):
+            roots.append(
+                {
+                    "IOObjectClass": "AppleUSBRootHubDevice",
+                    "idVendor": 0x05AC,
+                    "idProduct": 0x8007,
+                    "locationID": bus << 24 | (0xFFFFFFFF00000000 if bus & 0x80 else 0),
+                    "bDeviceClass": 9,
+                    "Device Speed": SUPER,
+                    "USB Product Name": "AppleUSBXHCI Root Hub Simulation",
+                    "IORegistryEntryChildren": under(bus << 24),
+                }
+            )
+        return {"IORegistryEntryName": "Root", "IOObjectClass": "IORegistryEntry", "IORegistryEntryChildren": roots}
+
+    def __call__(self, argv, timeout):
+        self.calls += 1
+        if self.output is not None:
+            return self.output
+        return uswitch.Result(0, plistlib.dumps(self.tree()).decode(), "")
+
+
 class MacCase(Case):
     def setUp(self):
         super().setUp()
         self.m1ddc = FakeM1ddc(self.clock)
-        self.ctx.run = self.m1ddc
+        self.ioreg = FakeIoreg()
+        self.ctx.run = lambda argv, timeout: (self.ioreg if argv[0] == "ioreg" else self.m1ddc)(argv, timeout)
         self.ctx.platform = uswitch.Mac()
         self.ctx.home = os.path.join(self.tmp, "home")
         self.ctx.sysfs = os.path.join(self.tmp, "no-sysfs")
@@ -93,14 +172,14 @@ class MacCase(Case):
     def conf(self):
         return os.path.join(self.ctx.home, "Library/Application Support/mswitch/mswitch.conf")
 
-    def learned(self, uuid=DELL, value=DP1, **kw):
+    def learned(self, uuid=DELL, value=DP1, usb=None, **kw):
         """A desk with one monitor, this Mac on `value`, written where mswitch reads it."""
-        return self.learned_all([(uuid, value, kw)])
+        return self.learned_all([(uuid, value, kw)], usb)
 
-    def learned_all(self, monitors):
+    def learned_all(self, monitors, usb=None):
         """A desk with each (uuid, this Mac's input, m1ddc.add arguments)."""
         config = uswitch.Config()
-        config.desks["home"] = uswitch.Desk("home")
+        config.desks["home"] = uswitch.Desk("home", usb)
         for uuid, value, kw in monitors:
             self.m1ddc.add(uuid, **kw)
             edid = uswitch.parse_m1ddc_list(listing((uuid, *self.m1ddc.displays[uuid][:4])))[uuid]
@@ -125,6 +204,61 @@ class ListTest(unittest.TestCase):
 
     def test_nothing_listed_is_no_monitors(self):
         self.assertEqual(uswitch.parse_m1ddc_list("No external display found, aborting"), {})
+
+
+class IoregTest(unittest.TestCase):
+    def setUp(self):
+        self.ioreg = FakeIoreg()
+
+    def devices(self):
+        return uswitch.parse_ioreg_usb(self.ioreg(["ioreg"], 1).stdout.encode())
+
+    def test_reads_each_device_at_its_location_id(self):
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, "USB2.1 Hub", hub=True)
+        self.ioreg.plug(0x14510000, 0x0BDA, 0x5409, "USB2.1 Hub", hub=True)
+        self.ioreg.plug(0x14512000, 0x0BDA, 0x5411, "4-Port USB 2.0 Hub", hub=True)
+        self.ioreg.plug(0x14512200, 0x046D, 0xC543, "USB Receiver", serial="SERIAL1", speed=FULL, maker="Logitech")
+        found = self.devices()
+        self.assertEqual(sorted(found), ["0x14500000", "0x14510000", "0x14512000", "0x14512200"])  # no root hub
+        hub, receiver = found["0x14500000"], found["0x14512200"]
+        self.assertEqual((hub.vendor, hub.product, hub.hub, hub.speed, hub.depth), ("0bda", "5409", True, 480.0, 1))
+        self.assertEqual(hub.name, "Generic USB2.1 Hub")
+        self.assertEqual((receiver.serial, receiver.hub, receiver.speed, receiver.depth), ("SERIAL1", False, 12.0, 4))
+        self.assertEqual(receiver.describe(), "046d:c543 serial SERIAL1 at 0x14512200 Logitech USB Receiver")
+
+    def test_a_new_enumeration_is_a_new_session(self):
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, hub=True)
+        before = self.devices()["0x14500000"]
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, hub=True)  # away and back
+        after = self.devices()["0x14500000"]
+        self.assertEqual(before, after)  # the same device...
+        self.assertNotEqual(before.devnum, after.devnum)  # ...enumerated again (D12)
+        trigger = uswitch.UsbTrigger("0bda", "5409")
+        self.assertNotEqual(trigger.generation({"a": before}), trigger.generation({"a": after}))
+
+    def test_a_sign_extended_location_reads_as_its_32_bits(self):
+        self.ioreg.plug(0x80200000, 0x05AC, 0x8103, "Headset")
+        self.assertEqual(list(self.devices()), ["0x80200000"])
+        self.assertEqual(self.devices()["0x80200000"].depth, 1)
+
+    def test_a_device_without_strings_reads_with_empty_ones(self):
+        self.ioreg.plug(0x14100000, 0x1234, 0x5678, name="", maker="")
+        device = self.devices()["0x14100000"]
+        self.assertEqual((device.name, device.serial), ("", ""))
+
+    def test_output_it_cant_read_is_an_error(self):
+        for bad in (b"", b"<plist", b"not a plist"):
+            with self.subTest(bad=bad), self.assertRaises(uswitch.UswitchError) as e:
+                uswitch.parse_ioreg_usb(bad)
+            self.assertIn("can't read ioreg's USB devices", str(e.exception))
+
+    def test_a_location_id_pins_a_port(self):
+        self.assertEqual(uswitch.UsbDevice("0x14512200", "1234", "5678", "", "", False, 12.0).depth, 4)
+        uswitch.UsbTrigger("1234", "5678", port="0x14500000").validate("here")
+        for bad in ("0x1450", "14500000", "0x1450000g"):
+            with self.subTest(port=bad), self.assertRaises(uswitch.UswitchError) as e:
+                uswitch.UsbTrigger("1234", "5678", port=bad).validate("here")
+            self.assertIn("a location ID like 0x14100000", str(e.exception))
 
 
 class MacSwitchTest(MacCase):
@@ -241,6 +375,41 @@ class MacSwitchTest(MacCase):
         self.assertEqual(forced, [True, False])
         self.assertEqual(sorted(os.listdir(directory)), ["mswitch.conf", "switch.lock"])
 
+    def test_a_setup_a_desk_switches_only_while_its_switch_points_here(self):
+        self.learned(usb=uswitch.UsbTrigger("0bda", "5409"))
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 0)
+        self.assertIn("points at another machine", self.out.getvalue())
+        self.assertEqual(self.m1ddc.displays[DELL][4], HDMI1)
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, hub=True)
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 0)
+        self.assertEqual(self.m1ddc.displays[DELL][4], DP1)
+
+    def test_a_press_away_and_back_unseen_is_caught_by_its_session(self):
+        # The hub leaves and comes back between two looks: only its new session
+        # ID shows the press, which brings back a monitor already finished with.
+        second = "22222222-2222-3333-4444-555555555555"
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, hub=True)
+        self.learned_all([(DELL, DP1, {}), (second, DP1, {"serial": "DEF5678", "ignore": 1})], uswitch.UsbTrigger("0bda", "5409"))
+        writes = []
+
+        def away_and_back(uuid, value):
+            if uuid == second:
+                writes.append(value)
+                if len(writes) == 1:
+                    self.m1ddc.displays[DELL][4] = HDMI1  # the other machine took it
+                    self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, hub=True)
+
+        self.m1ddc.on_set = away_and_back
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 0)
+        self.assertIn("went away and came back", self.out.getvalue())
+        self.assertEqual((self.m1ddc.displays[DELL][4], self.m1ddc.displays[second][4]), (DP1, DP1))
+
+    def test_a_failing_ioreg_is_reported(self):
+        self.learned(usb=uswitch.UsbTrigger("0bda", "5409"))
+        self.ioreg.output = uswitch.Result(1, "", "ioreg: something went wrong")
+        self.assertEqual(uswitch.main(["switch"], self.ctx), 1)
+        self.assertIn("mswitch: ioreg failed: ioreg: something went wrong", self.err.getvalue())
+
     def test_refuses_to_run_as_root(self):
         self.ctx.root = "/"  # live
         self.ctx.euid = 0
@@ -253,7 +422,7 @@ class MacLearnTest(MacCase):
     def test_learns_a_monitor_as_its_own_switch_into_the_users_library(self):
         self.m1ddc.add(DELL, current=USBC)
         self.m1ddc.add(BUILT_IN, name="Color LCD", mfg="APP", serial="(null)", answers=False)
-        self.answers = ["home", ""]  # the desk's name, then Enter: no USB switch question
+        self.answers = ["home", "b", ""]
         self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
         text = open(self.conf()).read()
         self.assertIn("# Written by mswitch learn", text)
@@ -264,11 +433,62 @@ class MacLearnTest(MacCase):
         self.assertIn("Color LCD", self.out.getvalue())  # the built-in panel doesn't answer: skipped
         self.assertIn(f"Wrote desk home to {self.conf()}.", self.out.getvalue())
 
-    def test_a_usb_switch_is_refused_until_it_is_built(self):
+    def add_switch(self):
+        """The switch's USB 3 hub pair and a receiver behind it, plus a built-in device."""
+        self.ioreg.plug(0x14500000, 0x0BDA, 0x5409, "USB2.1 Hub", hub=True)
+        self.ioreg.plug(0x14100000, 0x0BDA, 0x0409, "USB3.1 Hub", hub=True, speed=SUPER)
+        self.ioreg.plug(0x14510000, 0x046D, 0xC543, "USB Receiver", speed=FULL)
+        self.ioreg.plug(0x80100000, 0x05AC, 0x8233, "Apple T2 Controller", serial="SERIAL2")
+
+    def press(self, away_at=1.0, back_at=3.0):
+        """Press the switch away and back; the other machine takes the monitor."""
+        pair = [(0x14500000, (0x0BDA, 0x5409, "USB2.1 Hub"), {"hub": True}),
+                (0x14100000, (0x0BDA, 0x0409, "USB3.1 Hub"), {"hub": True, "speed": SUPER}),
+                (0x14510000, (0x046D, 0xC543, "USB Receiver"), {"speed": FULL})]
+
+        def away():
+            for location, _, _ in pair:
+                self.ioreg.unplug(location)
+            self.m1ddc.displays[DELL][4] = HDMI1
+
+        def back():
+            for location, args, kw in pair:
+                self.ioreg.plug(location, *args, **kw)
+
+        self.clock.at(away_at, away)
+        self.clock.at(back_at, back)
+
+    def test_learns_a_usb_switchs_usb2_hub(self):
         self.m1ddc.add(DELL, current=DP1)
-        self.answers = ["home"]
-        self.assertEqual(uswitch.main(["learn", "--usb", "1234:5678"], self.ctx), 2)
-        self.assertIn("can't use a USB switch yet", self.err.getvalue())
+        self.add_switch()
+        self.press()
+        self.answers = ["home", "a", ""]
+        self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
+        config = uswitch.load_config(self.conf())
+        self.assertEqual(config.desks["home"].usb, uswitch.UsbTrigger("0bda", "5409"))
+        self.assertIn("Trigger: 0bda:5409.", self.out.getvalue())
+        self.assertEqual(self.m1ddc.displays[DELL][4], DP1)  # switched back
+        self.assertEqual(uswitch.main(["status"], self.ctx), 0)
+        self.assertIn("USB switch 0bda:5409, present", self.out.getvalue())
+
+    def test_a_shared_hub_chip_pins_the_location_id(self):
+        self.m1ddc.add(DELL, current=DP1)
+        self.add_switch()
+        self.ioreg.plug(0x14200000, 0x0BDA, 0x5409, "USB2.1 Hub", hub=True)  # a dock's
+        self.press()
+        self.answers = ["home", "a", ""]
+        self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
+        self.assertIn("usb_port = 0x14500000", open(self.conf()).read())
+        config = uswitch.load_config(self.conf())
+        self.assertEqual(config.desks["home"].usb, uswitch.UsbTrigger("0bda", "5409", "", "0x14500000"))
+
+    def test_usb_option_takes_the_switch_without_presses(self):
+        self.m1ddc.add(DELL, current=DP1)
+        self.add_switch()
+        self.clock.at(1.0, lambda: self.m1ddc.displays[DELL].__setitem__(4, HDMI1))  # its buttons
+        self.answers = [""]
+        self.assertEqual(uswitch.main(["learn", "--desk", "home", "--usb", "0BDA:5409"], self.ctx), 0)
+        self.assertEqual(uswitch.load_config(self.conf()).desks["home"].usb, uswitch.UsbTrigger("0bda", "5409"))
 
     def test_status_has_no_power_button(self):
         self.learned()

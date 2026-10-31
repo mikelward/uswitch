@@ -10,12 +10,14 @@ import dataclasses
 import fcntl
 import hashlib
 import os
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import xml.parsers.expat
 from dataclasses import dataclass, field
 
 INPUT_SOURCE = "60"
@@ -62,6 +64,11 @@ MAC_DIR = "Library/Application Support/mswitch"
 M1DDC_HINT = "install it with `brew install m1ddc` (Apple silicon only)"
 # m1ddc's EDID UUID, a Mac's identity for a monitor without a serial (D17).
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# IOKit's location ID, a Mac's port path: the bus in the top byte, then a hex
+# digit per hub tier (D17).
+LOCATION = re.compile(r"0x[0-9a-f]{8}")
+# Mb/s for each of IOKit's USB speeds, as `ioreg` gives a device's "Device Speed".
+IOKIT_SPEEDS = {0: 1.5, 1: 12.0, 2: 480.0, 3: 5000.0, 4: 10000.0, 5: 20000.0}
 
 DDCUTIL_PACKAGE_HINT = "install the ddcutil package (apt install ddcutil, or dnf install ddcutil)"
 ACPID_PACKAGE_HINT = (
@@ -308,7 +315,7 @@ def connected_monitors(sysfs):
 
 @dataclass(frozen=True)
 class UsbDevice:
-    port: str  # the kernel name, which is its port path: "3-2", "3-2.1"
+    port: str  # the kernel name, its port path ("3-2", "3-2.1"); on a Mac, its location ID
     vendor: str
     product: str
     serial: str
@@ -321,6 +328,8 @@ class UsbDevice:
 
     @property
     def depth(self):
+        if LOCATION.fullmatch(self.port):
+            return len(self.port[4:].split("0")[0])  # a digit per hub tier, then zeros
         return 1 + self.port.count(".")
 
     def describe(self):
@@ -410,8 +419,8 @@ class UsbTrigger:
             raise UswitchError(f"{where}: usb_vendor and usb_product must be four hex digits")
         if self.serial and not udev_safe(self.serial):
             raise UswitchError(f"{where}: usb_serial has characters a udev rule can't match safely")
-        if self.port and not PORT.fullmatch(self.port):
-            raise UswitchError(f"{where}: usb_port must look like 3-2 or 3-2.1")
+        if self.port and not (PORT.fullmatch(self.port) or LOCATION.fullmatch(self.port)):
+            raise UswitchError(f"{where}: usb_port must look like 3-2 or 3-2.1 (on a Mac, a location ID like 0x14100000)")
 
 
 def trigger_for(device, devices):
@@ -523,7 +532,7 @@ def load_config(path):
                         values.get("usb_vendor", "").lower(),
                         values.get("usb_product", "").lower(),
                         values.get("usb_serial", ""),
-                        values.get("usb_port", ""),
+                        values.get("usb_port", "").lower(),
                     )
                     usb.validate(f"{path}: [{section}]")
                 config.desks[name] = Desk(name, usb)
@@ -812,7 +821,6 @@ class Linux:
     install_command = "sudo uswitch install"
     ddc_check = "`ddcutil detect`"
     power_button = True  # D13
-    usb = True  # USB switches (setup A)
 
     def config_path(self, ctx):
         return ctx.path(CONFIG)
@@ -881,6 +889,57 @@ def parse_m1ddc_list(text):
     return found
 
 
+def _ioreg_text(entry, *keys):
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def parse_ioreg_usb(data):
+    """{location ID: UsbDevice} from `ioreg -a -l -p IOUSB`: every USB device
+    but root hubs, as usb_devices() gives them on Linux (D17)."""
+    try:
+        tree = plistlib.loads(data)
+    except (plistlib.InvalidFileException, xml.parsers.expat.ExpatError, ValueError) as e:
+        raise UswitchError(f"can't read ioreg's USB devices: {e}")
+    devices = {}
+    entries = [tree]
+    while entries:
+        entry = entries.pop()
+        if isinstance(entry, list):
+            entries.extend(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        entries.extend(entry.get("IORegistryEntryChildren", []))
+        vendor, product, location = (entry.get(k) for k in ("idVendor", "idProduct", "locationID"))
+        if not all(isinstance(v, int) for v in (vendor, product, location)):
+            continue  # the plane's root, or a controller rather than a device
+        location &= 0xFFFFFFFF  # a T2 Mac's internal bus reports it sign-extended
+        if not location & 0xFFFFFF:
+            continue  # a root hub: no hub tier, and it never comes and goes with a switch
+        port = f"0x{location:08x}"
+        session = entry.get("sessionID")
+        names = (
+            _ioreg_text(entry, "USB Vendor Name", "kUSBVendorString"),
+            _ioreg_text(entry, "USB Product Name", "kUSBProductString"),
+        )
+        devices[port] = UsbDevice(
+            port=port,
+            vendor=f"{vendor & 0xFFFF:04x}",
+            product=f"{product & 0xFFFF:04x}",
+            serial=_ioreg_text(entry, "USB Serial Number", "kUSBSerialNumberString"),
+            name=" ".join(n for n in names if n),
+            hub=entry.get("bDeviceClass") == 9,
+            speed=IOKIT_SPEEDS.get(entry.get("Device Speed", entry.get("USBSpeed")), 0.0),
+            # New for every enumeration, as Linux's device number is (D12).
+            devnum=session if isinstance(session, int) else 0,
+        )
+    return devices
+
+
 @dataclass(frozen=True)
 class MacDisplay:
     """A connected monitor as m1ddc lists it, addressed by its system UUID (D17)."""
@@ -940,7 +999,6 @@ class Mac:
     install_command = "mswitch install"
     ddc_check = "`m1ddc display list detailed`"
     power_button = False  # macOS has no hook for it (D16)
-    usb = False  # USB switches arrive with ioreg (TODO.md)
 
     def config_path(self, ctx):
         return os.path.join(ctx.home, MAC_DIR, "mswitch.conf")
@@ -963,7 +1021,10 @@ class Mac:
         return [MacDisplay(uuid, edid) for uuid, edid in parse_m1ddc_list(r.stdout).items()]
 
     def usb_devices(self, ctx):
-        return {}
+        r = ctx.command(["ioreg", "-a", "-l", "-p", "IOUSB"])
+        if r.returncode != 0:
+            raise UswitchError(f"ioreg failed: {r.message()}")
+        return parse_ioreg_usb(r.stdout.encode())
 
     def ddc(self, ctx):
         return M1ddc(ctx)
@@ -1383,13 +1444,8 @@ def learn(ctx, desk_name=None, usb_spec=None):
     if not DESK_NAME.fullmatch(desk_name):
         raise UswitchError("desk names are letters, digits, '.', '_' and '-'", code=2)
     devices = platform.usb_devices(ctx)
-    if usb_spec and not platform.usb:
-        raise UswitchError(f"{platform.name} can't use a USB switch yet (TODO.md)", code=2)
     if usb_spec:
         setup_a = True
-    elif not platform.usb:
-        setup_a = False
-        ctx.say("A USB switch isn't supported here yet, so this desk's monitor is its own switch (setup B).")
     else:
         while True:
             answer = ctx.ask("Does this desk have a USB switch (a), or is a monitor its own switch (b)?", "a").lower()
