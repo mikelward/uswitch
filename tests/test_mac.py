@@ -168,7 +168,7 @@ class MacCase(Case):
         self.calls = []  # every other command: swiftc, launchctl
         self.failing = {}  # command name -> its error
         self.ctx.run = self.command
-        self.ctx.platform = uswitch.Mac()
+        self.ctx.platform = uswitch.Mac(machine="arm64")
         self.ctx.home = os.path.join(self.tmp, "home")
         self.ctx.sysfs = os.path.join(self.tmp, "no-sysfs")
         # Never the real Homebrew, whatever Mac runs the tests.

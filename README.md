@@ -72,17 +72,19 @@ sudo uswitch uninstall --purge    # removes it too
 
 ## On a Mac
 
-On an Apple silicon Mac the same program runs through
-[`m1ddc`](https://github.com/waydabber/m1ddc) instead of `ddcutil`. It runs as
-you, not as root, and keeps everything in your home directory. It's newer than
-the Linux side and hasn't been tried on a real Apple silicon Mac yet:
-`SPEC.md`'s *Phase 0* has the Mac steps that decide whether it works. Intel
-Macs aren't supported: the one tried passed no DDC/CI to the monitor.
+On a Mac the same program runs through
+[`m1ddc`](https://github.com/waydabber/m1ddc) on Apple silicon, or
+[`ddcctl`](https://github.com/kfix/ddcctl) on an Intel Mac, instead of
+`ddcutil`. It runs as you, not as root, and keeps everything in your home
+directory. It's newer than the Linux side: an Intel Mac has switched a Dell
+with `ddcctl` by hand, but uswitch itself hasn't run on a Mac yet, and
+`SPEC.md`'s *Phase 0* has the Mac steps that decide whether it works.
 
 ### Before installing
 
-1. Install `m1ddc` and Python 3.10 or later from Homebrew
-   (`brew install m1ddc python`), and Apple's Command Line Tools
+1. Install Python 3.10 or later and the DDC/CI tool from Homebrew:
+   `brew install m1ddc python` on Apple silicon, `brew install ddcctl python`
+   on an Intel Mac. Then Apple's Command Line Tools
    (`xcode-select --install`), which build uswitch's small helper.
 2. Turn on **DDC/CI** in each monitor's on-screen menu (on a Dell,
    **Menu → Others → DDC/CI**), and **Auto Select** off, as on Linux.
@@ -90,9 +92,11 @@ Macs aren't supported: the one tried passed no DDC/CI to the monitor.
    showing the Mac, `m1ddc display list detailed` lists it with its system
    UUID, and `m1ddc display UUID get input` gives the Mac's input. Then
    `sleep 10; m1ddc display UUID set input VALUE`, switching the monitor away
-   with its buttons during the sleep, should bring it back (*Phase 0*).
-   DisplayPort, or USB-C to the monitor's DisplayPort or USB-C input, is the
-   likeliest to work; some Macs' HDMI ports pass no DDC/CI.
+   with its buttons during the sleep, should bring it back (*Phase 0*). On an
+   Intel Mac it's `ddcctl -d 1 -i ?` for the input, then
+   `sleep 10; ddcctl -d 1 -i VALUE`. DisplayPort, or USB-C to the monitor's
+   DisplayPort or USB-C input, is the likeliest to work; some Macs' HDMI ports
+   pass no DDC/CI.
 
 ### Install
 
@@ -135,5 +139,6 @@ cat ~/Library/Logs/uswitch.log    # what the helper saw, and each run it started
 ## Development
 
 `make test` runs the `unittest` suite; it needs no hardware and no root, and
-tests the Mac side on Linux against faked `m1ddc`, `ioreg` and `launchctl`.
+tests the Mac side on Linux against faked `m1ddc`, `ddcctl`, `ioreg` and
+`launchctl`.
 `uswitch-helper.swift` builds only on a Mac; CI builds it whenever it changes.

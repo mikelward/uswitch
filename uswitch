@@ -70,6 +70,7 @@ HELPER_SOURCE = "uswitch-helper.swift"
 # A LaunchAgent and a shortcut run with only the system's directories on PATH.
 HOMEBREW_BINS = ("/opt/homebrew/bin", "/usr/local/bin")
 M1DDC_HINT = "install it with `brew install m1ddc` (Apple silicon only)"
+DDCCTL_HINT = "install it with `brew install ddcctl`"
 # m1ddc's EDID UUID, a Mac's identity for a monitor without a serial (D17).
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # IOKit's location ID, a Mac's port path: the bus in the top byte, then a hex
@@ -957,6 +958,55 @@ class MacDisplay:
     edid: Edid
 
 
+@dataclass(frozen=True)
+class DdcctlRun:
+    """What one `ddcctl -d N` run printed (D17)."""
+
+    found: object  # how many external displays it numbers, or None if it never said
+    uuids: list  # their CGDisplay UUIDs, in its numbering's order
+    name: str  # display N's EDID name and serial
+    serial: str
+    value: object  # the input it read, or None
+    error: str
+
+
+def parse_ddcctl(text):
+    """A DdcctlRun from ddcctl's output, all on stdout: `I:` lines say what it
+    found, and an `E:` line says what failed, though it still exits 0."""
+    lines = text.splitlines()
+
+    def first(pattern):
+        for line in lines:
+            m = re.match(pattern, line)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    found, value = first(r"I: found (\d+) external display"), first(r"I: VCP control #96 \(0x60\) = current: (\d+)")
+    # It reports not finding a display's location in WindowServer's preferences
+    # as an error, and carries on without it: no failure.
+    errors = [line[3:].strip() for line in lines if line.startswith("E: ") and "WindowServer's preferences" not in line]
+    return DdcctlRun(
+        found=None if found is None else int(found),
+        uuids=re.findall(r"^D: CGDisplay ([0-9A-Fa-f-]{36}) ", text, re.MULTILINE),
+        name=first(r"I: got edid\.name: (.*)$") or "",
+        serial=first(r"I: got edid\.serial: (.*)$") or "",
+        value=None if value is None else int(value),
+        error=errors[0] if errors else "",
+    )
+
+
+@dataclass(frozen=True)
+class IntelDisplay:
+    """A connected monitor as ddcctl numbers it, with the CGDisplay UUID that
+    shows whether that number is still it (D17)."""
+
+    index: int
+    uuid: str
+    edid: Edid
+    error: str = ""  # why ddcctl couldn't read it, when it couldn't
+
+
 def find_command(ctx, name):
     """`name` if it's on PATH, else its path where Homebrew installs it, else
     None: the helper's LaunchAgent and a shortcut run with only the system's
@@ -996,6 +1046,70 @@ class M1ddc:
         """None, or why the write failed."""
         r = self.run(["display", display.uuid, "set", "input", str(value)])
         return None if r.returncode == 0 else r.message()
+
+
+class Ddcctl:
+    """DDC/CI through ddcctl on an Intel Mac, whose only address for a monitor
+    is its number among the external displays (D14, D17)."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def run(self, args):
+        try:
+            r = self.ctx.command([find_command(self.ctx, "ddcctl") or "ddcctl", *args])
+        except MissingCommand:
+            raise UswitchError(f"ddcctl is not installed; {DDCCTL_HINT}")
+        return r, parse_ddcctl(r.stdout)
+
+    def displays(self):
+        r, first = self.run(["-d", "1"])
+        if first.found is None:
+            raise UswitchError(f"ddcctl failed: {r.message()}")
+        found = []
+        for index in range(1, first.found + 1):
+            run = first if index == 1 else self.run(["-d", str(index)])[1]
+            if len(run.uuids) < index:
+                break  # one went between these runs: the next listing has them as they are
+            uuid = run.uuids[index - 1]
+            edid = Edid(mfg="", model=run.name, serial=run.serial, raw=b"", uuid=uuid)
+            # Kept even when its EDID didn't read, with why, so the caller can say so.
+            found.append(IntelDisplay(index, uuid, edid, run.error))
+        return found
+
+    @staticmethod
+    def _renumbered(display, run):
+        if len(run.uuids) < display.index or run.uuids[display.index - 1].lower() != display.uuid.lower():
+            return f"ddcctl's display {display.index} is another monitor now; the displays changed"
+        return None
+
+    def get_input(self, display):
+        """(value, None), or (None, why) when the monitor didn't answer."""
+        r, run = self.run(["-d", str(display.index), "-i", "?"])
+        why = self._renumbered(display, run)
+        if why:
+            return None, why
+        if r.returncode != 0 or run.error or run.value is None:
+            return None, run.error or (r.message() if r.returncode != 0 else "ddcctl read no input")
+        return run.value & 0xFF, None
+
+    def set_input(self, display, value):
+        """None, or why the write failed."""
+        # A number is all ddcctl takes, and a display coming or going renumbers the
+        # rest: look first, so the write can't land on another monitor.
+        _, run = self.run(["-d", str(display.index)])
+        why = self._renumbered(display, run)
+        if why:
+            return why
+        r, run = self.run(["-d", str(display.index), "-i", str(value)])
+        if self._renumbered(display, run):
+            # The displays changed between the look and the write: ddcctl takes no
+            # other address, so all that's left is to say where the write went.
+            other = " ".join(s for s in (run.name, run.serial) if s) or f"display {display.index}"
+            return f"the displays changed as uswitch wrote, so the write went to {other}"
+        if r.returncode != 0 or run.error:
+            return run.error or r.message()
+        return None
 
 
 def launch_agent_text(helper, program, log, config):
@@ -1038,15 +1152,32 @@ def _take(path):
 
 
 class Mac:
-    """Where uswitch finds monitors and DDC/CI on an Apple silicon Mac: m1ddc,
-    run as the logged-in user, with everything in the user's Library (D14,
-    D15, D17)."""
+    """Where uswitch finds monitors and DDC/CI on a Mac: m1ddc on Apple silicon,
+    ddcctl on Intel, run as the logged-in user, with everything in the user's
+    Library (D14, D15, D17)."""
 
     name = "uswitch"
     learn_command = "uswitch learn"
     install_command = "uswitch install"
-    ddc_check = "`m1ddc display list detailed`"
     power_button = False  # macOS has no hook for it (D16)
+
+    def __init__(self, machine=None):
+        # arm64 on Apple silicon, x86_64 on Intel: which tool reaches the monitors (D14).
+        self.machine = machine or os.uname().machine
+        self.unreadable = set()  # (uuid, why) for each display ddcctl couldn't read, said once
+
+    @property
+    def apple_silicon(self):
+        return self.machine == "arm64"
+
+    @property
+    def tool(self):
+        """The DDC/CI tool for this Mac, and how to install it."""
+        return ("m1ddc", M1DDC_HINT) if self.apple_silicon else ("ddcctl", DDCCTL_HINT)
+
+    @property
+    def ddc_check(self):
+        return "`m1ddc display list detailed`" if self.apple_silicon else "`ddcctl -d 1`"
 
     def config_path(self, ctx):
         return os.path.join(ctx.home, MAC_DIR, "uswitch.conf")
@@ -1062,6 +1193,14 @@ class Mac:
         return True
 
     def monitors(self, ctx):
+        if not self.apple_silicon:
+            found = Ddcctl(ctx).displays()
+            for d in found:
+                # Once per display and error: a switch looks many times a second.
+                if d.error and (d.uuid, d.error) not in self.unreadable:
+                    self.unreadable.add((d.uuid, d.error))
+                    ctx.warn(f"ddcctl can't read display {d.index} ({d.uuid}): {d.error}")
+            return found
         r = M1ddc(ctx).run(["display", "list", "detailed"])
         if r.returncode != 0 and "No external display" not in r.stdout:
             raise UswitchError(f"m1ddc display list failed: {r.message()}")
@@ -1075,7 +1214,7 @@ class Mac:
         return parse_ioreg_usb(r.stdout.encode())
 
     def ddc(self, ctx):
-        return M1ddc(ctx)
+        return M1ddc(ctx) if self.apple_silicon else Ddcctl(ctx)
 
     def power_button_woke(self, ctx):
         return False
@@ -1135,8 +1274,9 @@ class Mac:
         self.require_privilege(ctx)
         if sys.version_info < (3, 10):
             raise UswitchError("uswitch needs Python 3.10 or later; run install with Homebrew's (`brew install python`)")
-        if find_command(ctx, "m1ddc") is None:
-            raise UswitchError(f"m1ddc is not installed; {M1DDC_HINT}")
+        tool, hint = self.tool
+        if find_command(ctx, tool) is None:
+            raise UswitchError(f"{tool} is not installed; {hint}")
         if ctx.which("swiftc") is None:
             raise UswitchError("swiftc is not installed; install Apple's Command Line Tools with `xcode-select --install`")
         source = os.path.join(os.path.dirname(os.path.realpath(ctx.self_path)), HELPER_SOURCE)

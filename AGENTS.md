@@ -8,9 +8,9 @@ last_modified: 2026-11-01
 
 Switches Dell monitors to this machine over DDC/CI when it should have them: a USB switch
 hands it its devices, it wakes behind a monitor that is its own KVM, or a shortcut asks.
-Linux with systemd, and Apple silicon Macs (SPEC D14); one Python 3.10+ file
-using the standard library, with `ddcutil` on Linux and `m1ddc` on macOS. `SPEC.md` is the
-contract: change it first.
+Linux with systemd, and Macs (SPEC D14); one Python 3.10+ file using the standard library,
+with `ddcutil` on Linux, and `m1ddc` (Apple silicon) or `ddcctl` (Intel) on macOS.
+`SPEC.md` is the contract: change it first.
 
 ## Fleet conventions
 
