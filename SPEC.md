@@ -24,13 +24,13 @@ This file is the contract: what uswitch does and why. Mechanics belong in code a
 
 ## Scope
 
-- **Linux**, on systemd distributions (Debian, Ubuntu, Fedora), and **macOS on Apple
-  silicon**, best effort (D14). Not portable to Windows, Intel Macs, or
-  non-systemd init.
+- **Linux**, on systemd distributions (Debian, Ubuntu, Fedora), and **macOS**, best effort
+  (D14). Not portable to Windows or non-systemd init.
 - **Dell monitors are the tested target.** Any monitor that honors MCCS VCP `0x60` from an
   input it isn't showing should work, but only Dell is supported.
 - **External binary: `ddcutil`** on Linux (packaged as `ddcutil` on all three
-  distributions), **`m1ddc`** on macOS (Homebrew). It does the DDC/CI protocol work;
+  distributions); on macOS (Homebrew), **`m1ddc`** on Apple silicon and **`ddcctl`** on
+  an Intel Mac. It does the DDC/CI protocol work;
   uswitch decides when and what to send.
 - **External daemon: `acpid`** (packaged as `acpid` on all three), for the power button
   (D13), unless that is turned off. It is small, long-standing, and runs a command per ACPI
@@ -285,7 +285,7 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - At a setup B desk every wake already switches; the power button changes nothing there
   except while awake.
 
-### D14. On a Mac it is the same program, on Apple silicon, best effort
+### D14. On a Mac it is the same program, best effort
 
 - **One program, one name.** The same file runs on macOS with a macOS backend, and is
   `uswitch` there too, so every machine takes the same commands. Desks and the desk check
@@ -293,8 +293,11 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
   format are shared, so a fix to either lands in both.
 - **Apple silicon, through `m1ddc`.** It reaches a monitor's DDC/CI through a private macOS
   interface, the one MonitorControl and BetterDisplay use, so a macOS update can break it.
-  Intel Macs aren't supported: the one tested reached its Dell over neither HDMI nor
-  USB-C, with `ddcctl` or MonitorControl.
+- **Intel, through `ddcctl`.** An Intel Mac reaches DDC/CI through its display's
+  framebuffer, which `ddcctl` drives; `m1ddc` doesn't run there. The Intel Mac tested
+  switched its Dell back to USB-C from another input (Phase 0 step 3) once the monitor's
+  DDC/CI setting was on: off, it had looked like the Mac couldn't. uswitch picks the tool
+  by the Mac's processor.
 - **Best effort.** USB-C or Thunderbolt straight to the monitor's DisplayPort or USB-C input
   is the supported connection. A Mac or port that doesn't pass DDC/CI (several built-in
   HDMI ports, M1 and entry-level M2 among them) is documented as unsupported, not worked
@@ -329,12 +332,22 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - **No `power`.** macOS offers no hook for the power button while the Mac is awake, and no
   reliable way to tell a wake by the power button from any other (D13 is Linux only).
 
-### D17. On a Mac, monitors come from `m1ddc` and USB devices from `ioreg`
+### D17. On a Mac, monitors come from `m1ddc` or `ddcctl`, and USB devices from `ioreg`
 
 - `m1ddc display list detailed` gives each monitor's manufacturer, product name and
   serial, the EDID fields D6 identifies it by; a monitor without a serial is identified
   by its EDID UUID. Every command addresses a monitor by the system UUID from the same
   listing, never by list number (D6).
+- `ddcctl -d N` reads display N's EDID name and serial, which identify it there; it
+  doesn't print the manufacturer. Its only address is that number, which changes when
+  a display comes or goes, so every run also lists the displays' CGDisplay UUIDs in its
+  numbering's order. uswitch checks that number N is still the monitor it means before
+  writing, and that a read came from it, and otherwise skips it for now. A display
+  coming or going in the moment between that check and the write can still send the
+  write to another monitor, since `ddcctl` takes no other address; uswitch then says
+  which monitor got it. A display `ddcctl` can't read is reported once, with its error,
+  and the others still switch. A monitor without a serial is identified by its CGDisplay
+  UUID.
 - USB devices come from `ioreg`. A device's IOKit location ID (`0x14100000`, as System
   Information shows it) stands in for the port path a pin records (D1); its digits after
   the bus are the hub tiers, so it gives the depth D2 picks by. A device that
@@ -491,7 +504,8 @@ On each machine, before any code:
    monitor isn't showing; whether a monitor in power saving answers, and whether
    `setvcp 0x60` wakes it; whether a second `setvcp 0x60` sent mid-switch is ignored.
 
-On a Mac (D14–D17), with `m1ddc` from Homebrew:
+On a Mac (D14–D17), with `m1ddc` from Homebrew, or on an Intel Mac `ddcctl` (`ddcctl -d N`
+lists display N, `-i ?` reads its input and `-i VALUE` sets it):
 
 1. `m1ddc display list detailed`: each Dell appears with its manufacturer, product name and
    serial.
@@ -518,11 +532,12 @@ install` and `make uninstall` are shorthands for `./uswitch install` and `uninst
 `PYTHON` naming the interpreter.
 
 On a Mac, `uswitch` needs Homebrew's Python, since the one with the Command Line Tools is
-3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`,
-plus `ioreg` and `launchctl` from macOS. `install` builds the helper from
+3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`
+(Apple silicon) or `ddcctl` (Intel), plus `ioreg` and `launchctl` from macOS. `install` builds the helper from
 `uswitch-helper.swift`, one file beside `uswitch`, with `swiftc` from the Command Line
 Tools; nothing else is compiled. A LaunchAgent and a shortcut run with only the system's
-directories on `PATH`, so `uswitch` also looks for `m1ddc` where Homebrew installs it.
+directories on `PATH`, so `uswitch` also looks for `m1ddc` and `ddcctl` where Homebrew
+installs them.
 
 ## Testing
 
@@ -545,10 +560,10 @@ directories on `PATH`, so `uswitch` also looks for `m1ddc` where Homebrew instal
 - Power-button wakes (D13) against a fake `/sys/class/wakeup`: a count that grew between
   runs skips the desk check; an unchanged one, the first run after boot, another wakeup
   source, or the setting off don't.
-- The macOS backend runs in the same suite on Linux, against faked `m1ddc` and `ioreg`
-  output and a fake `launchctl`: identity, the lock (D15), the LaunchAgent as text, and
-  the desk checks above. The helper builds on a macOS runner, only in pull requests that
-  change it.
+- The macOS backend runs in the same suite on Linux, against faked `m1ddc`, `ddcctl` and
+  `ioreg` output and a fake `launchctl`: identity, `ddcctl`'s renumbering, the lock (D15),
+  the LaunchAgent as text, and the desk checks above. The helper builds on a macOS runner,
+  only in pull requests that change it.
 - Real udev, real monitors, the USB switch and a real Mac need hardware: Phase 0, then a
   manual checklist per release.
 
@@ -566,7 +581,9 @@ directories on `PATH`, so `uswitch` also looks for `m1ddc` where Homebrew instal
   Phase 0 step 7 tells. A press while awake that acpid misses goes uncounted until the next
   run, which then takes it as a wake.
 - On a Mac, nothing switches at the login window until Phase 0 shows it can (D15), and a
-  macOS update can break `m1ddc`'s private interface (D14).
+  macOS update can break `m1ddc`'s private interface, or the deprecated framebuffer calls
+  `ddcctl` makes (D14). On an Intel Mac, a display coming or going at the instant uswitch
+  writes can switch another monitor instead; uswitch says which (D17).
 
 ## Out of scope
 
@@ -574,7 +591,7 @@ directories on `PATH`, so `uswitch` also looks for `m1ddc` where Homebrew instal
 - Moving the USB devices themselves; the switch does that.
 - Coordinating machines over the network, or a software KVM (Barrier, Input Leap).
 - Audio routing.
-- Non-Dell monitors beyond best effort; Windows; Intel Macs; non-systemd Linux.
+- Non-Dell monitors beyond best effort; Windows; non-systemd Linux.
 
 ## Prior art
 

@@ -1,16 +1,13 @@
 # TODO
 
-- **macOS** (`SPEC.md` D14–D17): run Phase 0's Mac steps on an Apple silicon
-  Mac. It was built ahead of them, since none is on hand yet; they decide whether it
-  works, before anyone relies on it.
-  - **Tried** (2026-10-31): an Intel Mac on the Dell's HDMI input, then its USB-C input.
-    `ddcctl` finds the monitor and its EDID, and `ioreg`'s `IODisplayEDID` parses with
-    `parse_edid` as is, but no DDC/CI gets through on either port: reading `0x60` times
-    out, writing the input from another one doesn't switch, a brightness write leaves
-    the monitor alone, and MonitorControl falls back to dimming in software. That Mac
-    is unsupported; DisplayPort from the same Thunderbolt port is the same output, so
-    it wasn't tried. An M6 Mac mini over Thunderbolt to the Dell's DisplayPort input is
-    the next candidate.
+- **macOS** (`SPEC.md` D14–D17): run Phase 0's Mac steps with uswitch installed, on the
+  Intel Mac (through `ddcctl`) and on an Apple silicon one (through `m1ddc`) when there
+  is one. It was built ahead of them; they decide whether it works, before anyone
+  relies on it.
+  - **Tried** (2026-11-01): the Intel Mac on the Dell's USB-C input passes Phase 0
+    step 3 with `ddcctl`: it reads brightness and the input (27, `0x1b`), and switches
+    the monitor back from another input. Its failure on 2026-10-31, over HDMI and then
+    USB-C, came from the monitor's DDC/CI setting being off.
 
 ## Decisions needing review
 
