@@ -18,14 +18,14 @@ show this machine's input. It serves two setups:
   monitor's KVM brings the keyboard and mouse along (D10).
 
 A machine can sit at several desks, a laptop at home and at work say, each set up either
-way (D11). On an Apple silicon Mac the same program runs as `mswitch` (D14).
+way (D11). The same program runs on an Apple silicon Mac too (D14).
 
 This file is the contract: what uswitch does and why. Mechanics belong in code and tests.
 
 ## Scope
 
 - **Linux**, on systemd distributions (Debian, Ubuntu, Fedora), and **macOS on Apple
-  silicon** as `mswitch`, best effort (D14). Not portable to Windows, Intel Macs, or
+  silicon**, best effort (D14). Not portable to Windows, Intel Macs, or
   non-systemd init.
 - **Dell monitors are the tested target.** Any monitor that honors MCCS VCP `0x60` from an
   input it isn't showing should work, but only Dell is supported.
@@ -285,11 +285,12 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - At a setup B desk every wake already switches; the power button changes nothing there
   except while awake.
 
-### D14. On a Mac it is `mswitch`: the same program, on Apple silicon, best effort
+### D14. On a Mac it is the same program, on Apple silicon, best effort
 
-- **One program.** The same file runs on macOS with a macOS backend and is installed as
-  `mswitch`. Desks and the desk check (D11), learning (D2), the waits (D12), identity by
-  EDID (D6) and the configuration's format are shared, so a fix to either lands in both.
+- **One program, one name.** The same file runs on macOS with a macOS backend, and is
+  `uswitch` there too, so every machine takes the same commands. Desks and the desk check
+  (D11), learning (D2), the waits (D12), identity by EDID (D6) and the configuration's
+  format are shared, so a fix to either lands in both.
 - **Apple silicon, through `m1ddc`.** It reaches a monitor's DDC/CI through a private macOS
   interface, the one MonitorControl and BetterDisplay use, so a macOS update can break it.
   Intel Macs aren't supported: the one tested reached its Dell over neither HDMI nor
@@ -302,16 +303,16 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 ### D15. On a Mac it runs as the user, with one helper
 
 - **Per user, not system-wide** (unlike D4). `m1ddc` finds monitors through the window
-  server, which only a logged-in user's session reaches, so `mswitch` runs as that user:
+  server, which only a logged-in user's session reaches, so `uswitch` runs as that user:
   no `sudo`, the configuration in the user's Library, a LaunchAgent in place of units.
   Until Phase 0 shows otherwise, nothing switches at the login window.
 - **One helper.** Python's standard library can't subscribe to IOKit's device arrivals or
   to the wake notification, so a small Swift helper, which `install` compiles, runs while
-  the user is logged in and starts `mswitch switch` on each trigger. It is uswitch's one
+  the user is logged in and starts `uswitch switch` on each trigger. It is uswitch's one
   resident process (unlike D3); between triggers it only waits. Its LaunchAgent passes it
   the desks' trigger devices; `learn` rewrites them and restarts it, as it rewrites the
   udev rule on Linux.
-- **One run at a time, no trigger lost.** `mswitch switch` records the trigger, then
+- **One run at a time, no trigger lost.** `uswitch switch` records the trigger, then
   takes a lock; a start that finds it held leaves the trigger to the run in progress,
   as systemd folds a start into one (D12). The run holding the lock runs again while a
   trigger is pending, so a monitor it had already finished with comes back too.
@@ -323,7 +324,7 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 - **`wake`**: at login and on every wake from sleep, with the same desk check (D10, D11),
   and the same `[wake] enabled = no` to turn it off. Login is when the helper starts, so
   `install` and `learn` restarting it count too.
-- **manual**: `mswitch switch` from a shortcut (Shortcuts.app, or a hotkey tool). It runs
+- **manual**: `uswitch switch` from a shortcut (Shortcuts.app, or a hotkey tool). It runs
   as the user, so no password rule is needed.
 - **No `power`.** macOS offers no hook for the power button while the Mac is awake, and no
   reliable way to tell a wake by the power button from any other (D13 is Linux only).
@@ -350,7 +351,7 @@ machine past the desk check (D11), at either kind of desk. On by default; turn i
 | `uswitch switch [--dry-run] [--force] [--power-button-only]` | Switch the connected monitors to this machine, after the desk check unless `--force` or a power-button wake; with `--power-button-only`, only on a power-button wake; what the units run (D10, D11, D13). |
 | `uswitch status` | Show the configured desks, which one is connected, whether its trigger is present, and each monitor's current input against this machine's. |
 
-On a Mac the commands are the same as `mswitch`, without `sudo`; `--power-button-only`
+On a Mac the commands are the same, without `sudo`; `--power-button-only`
 doesn't apply (D16).
 
 ## What gets installed
@@ -382,11 +383,11 @@ On a Mac, everything is the user's own (D15):
 
 | Path | Written by | Does |
 |---|---|---|
-| `~/.local/bin/mswitch` | `install` | The program. A shortcut calls it by this full path. |
-| `~/Library/Application Support/mswitch/mswitch.conf` | `learn` | Desks, monitors and inputs (*Configuration*). |
-| `~/Library/Application Support/mswitch/mswitch-helper` | `install` | The helper (D15), compiled from `mswitch-helper.swift`. |
-| `~/Library/LaunchAgents/com.github.mikelward.mswitch.plist` | `install`, `learn` | Runs the helper while the user is logged in, with the desks' trigger devices (D16). |
-| `~/Library/Logs/mswitch.log` | the helper | What it saw, and what each `mswitch switch` it ran printed. |
+| `~/.local/bin/uswitch` | `install` | The program. A shortcut calls it by this full path. |
+| `~/Library/Application Support/uswitch/uswitch.conf` | `learn` | Desks, monitors and inputs (*Configuration*). |
+| `~/Library/Application Support/uswitch/uswitch-helper` | `install` | The helper (D15), compiled from `uswitch-helper.swift`. |
+| `~/Library/LaunchAgents/com.github.mikelward.uswitch.plist` | `install`, `learn` | Runs the helper while the user is logged in, with the desks' trigger devices (D16). |
+| `~/Library/Logs/uswitch.log` | the helper | What it saw, and what each `uswitch switch` it ran printed. |
 
 `uninstall` removes them all except the configuration and the log, which `--purge`
 removes too.
@@ -496,7 +497,7 @@ On a Mac (D14–D17), with `m1ddc` from Homebrew:
    serial.
 2. With the monitor showing the Mac, `m1ddc display UUID get input`: note the value.
 3. Switch the monitor to another input with its buttons, then `m1ddc display UUID set
-   input VALUE`. As on Linux, **this step decides whether `mswitch` can work** for that
+   input VALUE`. As on Linux, **this step decides whether `uswitch` can work** for that
    monitor and port. Time it.
 4. Setup A: `ioreg -p IOUSB -w0 -l` before and after pressing the switch: the switch's hub
    appears, with a new session ID.
@@ -504,8 +505,8 @@ On a Mac (D14–D17), with `m1ddc` from Homebrew:
    until `m1ddc` lists the monitor and the switch lands (D12).
 6. Log out, and run step 3 over `ssh` at the login window: whether anything can switch
    before login (D15).
-7. After `mswitch install`, press the switch away and back, then sleep and wake the Mac:
-   `~/Library/Logs/mswitch.log` shows the helper starting a run for each, which checks
+7. After `uswitch install`, press the switch away and back, then sleep and wake the Mac:
+   `~/Library/Logs/uswitch.log` shows the helper starting a run for each, which checks
    that it sees the hub arrive and the wake (D16).
 
 ## Implementation
@@ -514,12 +515,12 @@ Python 3.10 or later (Ubuntu 22.04's), standard library only, in one executable 
 `uswitch`, that runs from a checkout with no build step. On Linux `ddcutil` is the only
 external binary. The configuration is read and written with `configparser`.
 
-On a Mac, `mswitch` needs Homebrew's Python, since the one with the Command Line Tools is
+On a Mac, `uswitch` needs Homebrew's Python, since the one with the Command Line Tools is
 3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`,
 plus `ioreg` and `launchctl` from macOS. `install` builds the helper from
-`mswitch-helper.swift`, one file beside `uswitch`, with `swiftc` from the Command Line
+`uswitch-helper.swift`, one file beside `uswitch`, with `swiftc` from the Command Line
 Tools; nothing else is compiled. A LaunchAgent and a shortcut run with only the system's
-directories on `PATH`, so `mswitch` also looks for `m1ddc` where Homebrew installs it.
+directories on `PATH`, so `uswitch` also looks for `m1ddc` where Homebrew installs it.
 
 ## Testing
 

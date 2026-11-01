@@ -1,15 +1,15 @@
-// mswitch-helper: starts `mswitch switch` when a desk's USB switch arrives, when
+// uswitch-helper: starts `uswitch switch` when a desk's USB switch arrives, when
 // the user logs in, and when the Mac wakes (SPEC.md D15, D16). It decides
-// nothing itself: every desk check is mswitch's (D10, D11), and mswitch runs one
+// nothing itself: every desk check is uswitch's (D10, D11), and uswitch runs one
 // switch at a time, so a trigger arriving mid-run is never lost (D15).
 //
-// `mswitch install` compiles it, and the LaunchAgent that `install` and `learn`
+// `uswitch install` compiles it, and the LaunchAgent that `install` and `learn`
 // write runs it as:
 //
-//   mswitch-helper PROGRAM [--wake] [--usb VENDOR PRODUCT SERIAL LOCATION]...
+//   uswitch-helper PROGRAM [--wake] [--usb VENDOR PRODUCT SERIAL LOCATION]...
 //
 // VENDOR and PRODUCT are four hex digits; SERIAL and LOCATION (0x14100000) are
-// empty to match any, as in mswitch.conf (D1, D17).
+// empty to match any, as in uswitch.conf (D1, D17).
 
 import AppKit
 import Foundation
@@ -31,11 +31,11 @@ struct Arguments {
 // To the log the LaunchAgent names, unbuffered, between the lines of the runs it starts.
 func log(_ message: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
-    FileHandle.standardOutput.write(Data("\(stamp) mswitch-helper: \(message)\n".utf8))
+    FileHandle.standardOutput.write(Data("\(stamp) uswitch-helper: \(message)\n".utf8))
 }
 
 func usage() -> Never {
-    log("usage: mswitch-helper PROGRAM [--wake] [--usb VENDOR PRODUCT SERIAL LOCATION]...")
+    log("usage: uswitch-helper PROGRAM [--wake] [--usb VENDOR PRODUCT SERIAL LOCATION]...")
     exit(2)
 }
 

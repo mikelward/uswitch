@@ -1,4 +1,4 @@
-# Builds mswitch's helper on macOS, as `mswitch install` does (SPEC.md D15,
+# Builds uswitch's helper on macOS, as `uswitch install` does (SPEC.md D15,
 # Testing). Only for changes to the helper or this file: the Python suite in
 # ci.yml covers everything else on Linux, faking the Mac's commands.
 #
@@ -12,10 +12,10 @@ name: helper
 on:
   push:
     branches: [main]
-    paths: [mswitch-helper.swift, .github/workflows/helper.yml]
+    paths: [uswitch-helper.swift, .github/workflows/helper.yml]
   pull_request:
     types: [opened, synchronize, reopened]
-    paths: [mswitch-helper.swift, .github/workflows/helper.yml]
+    paths: [uswitch-helper.swift, .github/workflows/helper.yml]
 permissions:
   contents: read
 jobs:
@@ -27,9 +27,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Build it as install does
-        run: swiftc -O -o mswitch-helper mswitch-helper.swift
+        run: swiftc -O -o uswitch-helper uswitch-helper.swift
       - name: It refuses arguments it doesn't know
         run: |
           status=0
-          ./mswitch-helper --nonsense || status=$?
+          ./uswitch-helper --nonsense || status=$?
           test "$status" -eq 2

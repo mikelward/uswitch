@@ -197,10 +197,10 @@ class MacCase(Case):
         return os.path.join(self.ctx.home, rel)
 
     def conf(self):
-        return os.path.join(self.ctx.home, "Library/Application Support/mswitch/mswitch.conf")
+        return os.path.join(self.ctx.home, "Library/Application Support/uswitch/uswitch.conf")
 
     def learned(self, uuid=DELL, value=DP1, usb=None, **kw):
-        """A desk with one monitor, this Mac on `value`, written where mswitch reads it."""
+        """A desk with one monitor, this Mac on `value`, written where uswitch reads it."""
         return self.learned_all([(uuid, value, kw)], usb)
 
     def learned_all(self, monitors, usb=None):
@@ -338,7 +338,7 @@ class MacSwitchTest(MacCase):
         self.learned()
         self.m1ddc.missing = True
         self.assertEqual(uswitch.main(["switch"], self.ctx), 1)
-        self.assertIn("mswitch: m1ddc is not installed; install it with `brew install m1ddc`", self.err.getvalue())
+        self.assertIn("uswitch: m1ddc is not installed; install it with `brew install m1ddc`", self.err.getvalue())
 
     def test_a_switch_already_running_takes_the_trigger(self):
         self.learned()
@@ -400,7 +400,7 @@ class MacSwitchTest(MacCase):
         self.ctx.platform.serialize(self.ctx, True, lambda force: forced.append(force) or 0)
         self.ctx.platform.serialize(self.ctx, False, lambda force: forced.append(force) or 0)
         self.assertEqual(forced, [True, False])
-        self.assertEqual(sorted(os.listdir(directory)), ["mswitch.conf", "switch.lock"])
+        self.assertEqual(sorted(os.listdir(directory)), ["switch.lock", "uswitch.conf"])
 
     def test_a_setup_a_desk_switches_only_while_its_switch_points_here(self):
         self.learned(usb=uswitch.UsbTrigger("0bda", "5409"))
@@ -435,7 +435,7 @@ class MacSwitchTest(MacCase):
         self.learned(usb=uswitch.UsbTrigger("0bda", "5409"))
         self.ioreg.output = uswitch.Result(1, "", "ioreg: something went wrong")
         self.assertEqual(uswitch.main(["switch"], self.ctx), 1)
-        self.assertIn("mswitch: ioreg failed: ioreg: something went wrong", self.err.getvalue())
+        self.assertIn("uswitch: ioreg failed: ioreg: something went wrong", self.err.getvalue())
 
     def test_refuses_to_run_as_root(self):
         self.ctx.root = "/"  # live
@@ -452,7 +452,7 @@ class MacLearnTest(MacCase):
         self.answers = ["home", "b", ""]
         self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
         text = read(self.conf())
-        self.assertIn("# Written by mswitch learn", text)
+        self.assertIn("# Written by uswitch learn", text)
         self.assertNotIn("[power_button]", text)
         config = uswitch.load_config(self.conf())
         self.assertEqual([(m.desk, m.serial, m.input) for m in config.monitors], [("home", "ABC1234", USBC)])
@@ -528,8 +528,8 @@ class MacLearnTest(MacCase):
 
 class LaunchAgentTest(unittest.TestCase):
     def agent(self, config):
-        text = uswitch.launch_agent_text("/h/helper", "/h/mswitch", "/h/mswitch.log", config)
-        self.assertIn("<!-- Written by mswitch install and learn", text)
+        text = uswitch.launch_agent_text("/h/helper", "/h/uswitch", "/h/uswitch.log", config)
+        self.assertIn("<!-- Written by uswitch install and learn", text)
         return plistlib.loads(text.encode())
 
     def test_runs_the_helper_with_the_program_and_each_desks_switch(self):
@@ -540,20 +540,20 @@ class LaunchAgentTest(unittest.TestCase):
         agent = self.agent(config)
         self.assertEqual(
             agent["ProgramArguments"],
-            ["/h/helper", "/h/mswitch", "--wake",
+            ["/h/helper", "/h/uswitch", "--wake",
              "--usb", "0bda", "5409", "SERIAL1", "0x14500000",
              "--usb", "05e3", "0610", "", ""],
         )
-        self.assertEqual(agent["Label"], "com.github.mikelward.mswitch")
+        self.assertEqual(agent["Label"], "com.github.mikelward.uswitch")
         self.assertEqual((agent["RunAtLoad"], agent["KeepAlive"]), (True, True))
-        self.assertEqual(agent["StandardErrorPath"], "/h/mswitch.log")
+        self.assertEqual(agent["StandardErrorPath"], "/h/uswitch.log")
 
     def test_wake_off_drops_the_wake_trigger(self):
         config = uswitch.Config(wake=False)
-        self.assertEqual(self.agent(config)["ProgramArguments"], ["/h/helper", "/h/mswitch"])
+        self.assertEqual(self.agent(config)["ProgramArguments"], ["/h/helper", "/h/uswitch"])
 
     def test_nothing_learned_watches_for_wakes(self):
-        self.assertEqual(self.agent(None)["ProgramArguments"], ["/h/helper", "/h/mswitch", "--wake"])
+        self.assertEqual(self.agent(None)["ProgramArguments"], ["/h/helper", "/h/uswitch", "--wake"])
 
     def test_a_linux_port_pin_is_refused(self):
         config = uswitch.Config()
@@ -566,9 +566,9 @@ class LaunchAgentTest(unittest.TestCase):
 class MacInstallTest(MacCase):
     def setUp(self):
         super().setUp()
-        self.agent = self.home("Library/LaunchAgents/com.github.mikelward.mswitch.plist")
-        self.helper = self.home("Library/Application Support/mswitch/mswitch-helper")
-        self.program = self.home(".local/bin/mswitch")
+        self.agent = self.home("Library/LaunchAgents/com.github.mikelward.uswitch.plist")
+        self.helper = self.home("Library/Application Support/uswitch/uswitch-helper")
+        self.program = self.home(".local/bin/uswitch")
         self.ctx.euid = 501
 
     def arguments(self):
@@ -580,7 +580,7 @@ class MacInstallTest(MacCase):
         self.clock.at(1.0, lambda: self.m1ddc.displays[DELL].__setitem__(4, HDMI1))  # its buttons
         self.answers = ["home", "b", ""]
         self.assertEqual(uswitch.main(["install"], self.ctx), 0)
-        source = os.path.join(os.path.dirname(uswitch.__file__), "mswitch-helper.swift")
+        source = os.path.join(os.path.dirname(uswitch.__file__), "uswitch-helper.swift")
         self.assertEqual(self.calls[0], ["swiftc", "-O", "-o", self.helper + ".new", source])
         self.assertTrue(os.path.exists(source))
         self.assertEqual(read(self.helper), "a compiled helper\n")
@@ -592,10 +592,10 @@ class MacInstallTest(MacCase):
         self.assertEqual(self.arguments(), [self.helper, self.program, "--wake"])
         self.assertEqual(
             self.calls[1:],
-            [["launchctl", "bootout", "gui/501/com.github.mikelward.mswitch"],
+            [["launchctl", "bootout", "gui/501/com.github.mikelward.uswitch"],
              ["launchctl", "bootstrap", "gui/501", self.agent]] * 2,  # install, then learn
         )
-        self.assertIn("No desk learned yet; running `mswitch learn`.", self.out.getvalue())
+        self.assertIn("No desk learned yet; running `uswitch learn`.", self.out.getvalue())
         self.assertIsNotNone(uswitch.load_config(self.conf()))
 
     def test_reinstalling_keeps_the_desks_and_their_switches(self):
@@ -603,7 +603,7 @@ class MacInstallTest(MacCase):
         self.assertEqual(uswitch.main(["install"], self.ctx), 0)
         self.assertEqual(self.arguments(), [self.helper, self.program, "--wake", "--usb", "0bda", "5409", "", "0x14500000"])
         self.assertIn("at login and on wake", self.out.getvalue())
-        self.assertNotIn("running `mswitch learn`", self.out.getvalue())
+        self.assertNotIn("running `uswitch learn`", self.out.getvalue())
 
     def test_learn_points_an_installed_helper_at_the_new_switch(self):
         self.learned()
@@ -621,7 +621,7 @@ class MacInstallTest(MacCase):
         self.m1ddc.add(DELL, current=DP1)
         self.answers = ["home", "b", ""]
         self.assertEqual(uswitch.main(["learn"], self.ctx), 0)
-        self.assertIn("until `mswitch install` sets up its helper", self.out.getvalue())
+        self.assertIn("until `uswitch install` sets up its helper", self.out.getvalue())
         self.assertFalse(os.path.exists(self.agent))
         self.assertEqual(self.calls, [])
 
@@ -661,9 +661,9 @@ class MacInstallTest(MacCase):
         self.assertIn("needs Python 3.10 or later", self.err.getvalue())
 
     def test_a_failed_build_installs_nothing(self):
-        self.failing["swiftc"] = "mswitch-helper.swift:1:1: error: something"
+        self.failing["swiftc"] = "uswitch-helper.swift:1:1: error: something"
         self.assertEqual(uswitch.main(["install"], self.ctx), 1)
-        self.assertIn("building the helper failed: mswitch-helper.swift:1:1: error: something", self.err.getvalue())
+        self.assertIn("building the helper failed: uswitch-helper.swift:1:1: error: something", self.err.getvalue())
         self.assertFalse(os.path.exists(self.program))
         self.assertFalse(os.path.exists(self.agent))
         self.assertEqual(os.listdir(os.path.dirname(self.helper)), [])
@@ -687,17 +687,17 @@ class MacInstallTest(MacCase):
         self.assertEqual(uswitch.main(["install"], self.ctx), 0)
         self.calls.clear()
         self.assertEqual(uswitch.main(["uninstall"], self.ctx), 0)
-        self.assertEqual(self.calls, [["launchctl", "bootout", "gui/501/com.github.mikelward.mswitch"]])
+        self.assertEqual(self.calls, [["launchctl", "bootout", "gui/501/com.github.mikelward.uswitch"]])
         for path in (self.agent, self.helper, self.program):
             self.assertFalse(os.path.exists(path), path)
         self.assertTrue(os.path.exists(self.conf()))
-        self.assertIn("`mswitch uninstall --purge` removes it too", self.out.getvalue())
+        self.assertIn("`uswitch uninstall --purge` removes it too", self.out.getvalue())
 
     def test_uninstall_purge_leaves_nothing_behind(self):
         self.learned()
         self.assertEqual(uswitch.main(["install"], self.ctx), 0)
         self.assertEqual(uswitch.main(["switch"], self.ctx), 0)  # leaves its lock
-        uswitch.write_file(self.home("Library/Logs/mswitch.log"), "a run\n")
+        uswitch.write_file(self.home("Library/Logs/uswitch.log"), "a run\n")
         self.assertEqual(uswitch.main(["uninstall", "--purge"], self.ctx), 0)
         left = [os.path.join(d, f) for d, _, files in os.walk(self.ctx.home) for f in files]
         self.assertEqual(left, [])
@@ -705,7 +705,7 @@ class MacInstallTest(MacCase):
 
     def test_uninstall_with_nothing_installed_says_so(self):
         self.assertEqual(uswitch.main(["uninstall"], self.ctx), 0)
-        self.assertIn("Removed nothing; mswitch wasn't installed.", self.out.getvalue())
+        self.assertIn("Removed nothing; uswitch wasn't installed.", self.out.getvalue())
         self.assertEqual(self.calls, [])
 
 

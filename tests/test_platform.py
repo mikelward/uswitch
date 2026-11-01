@@ -118,11 +118,16 @@ class PlatformTest(Case):
 
 
 class DefaultPlatformTest(unittest.TestCase):
-    def test_a_mac_runs_as_mswitch_and_anything_else_as_uswitch(self):
+    def test_a_mac_gets_the_mac_platform_and_anything_else_linux(self):
         with mock.patch.object(uswitch.sys, "platform", "darwin"):
             self.assertIsInstance(uswitch.Context().platform, uswitch.Mac)
         with mock.patch.object(uswitch.sys, "platform", "linux"):
             self.assertIsInstance(uswitch.Context().platform, uswitch.Linux)
+
+    def test_both_are_uswitch(self):
+        # One name, so every machine takes the same commands (D14).
+        self.assertEqual((uswitch.Linux.name, uswitch.Mac.name), ("uswitch", "uswitch"))
+        self.assertEqual((uswitch.Linux.learn_command, uswitch.Mac.learn_command), ("sudo uswitch learn", "uswitch learn"))
 
     def test_the_shared_fixture_tests_linux_whatever_it_runs_on(self):
         # Codex on #13: run on a Mac, the Linux tests must still test Linux.

@@ -1,14 +1,14 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-31
+last_modified: 2026-11-01
 ---
 
 # uswitch
 
 Switches Dell monitors to this machine over DDC/CI when it should have them: a USB switch
 hands it its devices, it wakes behind a monitor that is its own KVM, or a shortcut asks.
-Linux with systemd, and Apple silicon Macs as `mswitch` (SPEC D14); one Python 3.10+ file
+Linux with systemd, and Apple silicon Macs (SPEC D14); one Python 3.10+ file
 using the standard library, with `ddcutil` on Linux and `m1ddc` on macOS. `SPEC.md` is the
 contract: change it first.
 
