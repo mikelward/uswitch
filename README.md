@@ -14,11 +14,19 @@ through `ddcutil`. Linux with systemd, and Apple silicon Macs
    `dnf install ddcutil acpid`) and Python 3.10 or later. `acpid` is for the
    power button; set `[power_button] enabled = no` in `/etc/uswitch.conf` to do
    without it.
-2. On each monitor's on-screen menu, turn **DDC/CI** on and **Auto Select** and
-   **USB-C Prioritization** off.
-3. Check by hand that the monitor accepts an input switch from an input it
-   isn't showing: `SPEC.md`'s *Phase 0* walks through it. Some monitors only
-   listen on the input they show, and uswitch can't work with those.
+2. In each monitor's on-screen menu, turn **DDC/CI** on: on a Dell it's under
+   **Menu → Others → DDC/CI**, and a monitor can come with it off. While you're
+   there, turn **Input Source → Auto Select** and **USB-C Prioritization** off.
+3. Check that the monitor answers: with it showing this machine,
+   `sudo ddcutil detect` lists it with a `VCP version`. If it says "This
+   monitor does not support DDC/CI" instead, check step 2's setting.
+4. Check that it switches from an input it isn't showing:
+   `sudo ddcutil getvcp 60` shows this machine's input (`sl=0x0f`, say). Then
+   `sleep 10; sudo ddcutil setvcp 60 0x0f`, switching the monitor to another
+   input with its buttons during the sleep, should bring it back. Add
+   `--bus N` from `detect` when there's more than one monitor. Some monitors
+   only listen on the input they show, and uswitch can't work with those;
+   `SPEC.md`'s *Phase 0* has the details.
 
 ## Install
 
@@ -76,10 +84,15 @@ Macs aren't supported: the one tried passed no DDC/CI to the monitor.
 1. Install `m1ddc` and Python 3.10 or later from Homebrew
    (`brew install m1ddc python`), and Apple's Command Line Tools
    (`xcode-select --install`), which build uswitch's small helper.
-2. Turn on **DDC/CI** in each monitor's on-screen menu, as on Linux, and check
-   by hand that `m1ddc` can switch it from an input it isn't showing (*Phase 0*).
-   DisplayPort, or USB-C to the monitor's DisplayPort, is the likeliest to
-   work; some Macs' HDMI ports pass no DDC/CI.
+2. Turn on **DDC/CI** in each monitor's on-screen menu (on a Dell,
+   **Menu → Others → DDC/CI**), and **Auto Select** off, as on Linux.
+3. Check that it switches from an input it isn't showing: with the monitor
+   showing the Mac, `m1ddc display list detailed` lists it with its system
+   UUID, and `m1ddc display UUID get input` gives the Mac's input. Then
+   `sleep 10; m1ddc display UUID set input VALUE`, switching the monitor away
+   with its buttons during the sleep, should bring it back (*Phase 0*).
+   DisplayPort, or USB-C to the monitor's DisplayPort or USB-C input, is the
+   likeliest to work; some Macs' HDMI ports pass no DDC/CI.
 
 ### Install
 
