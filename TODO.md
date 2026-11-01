@@ -8,6 +8,13 @@
     step 3 with `ddcctl`: it reads brightness and the input (27, `0x1b`), and switches
     the monitor back from another input. Its failure on 2026-10-31, over HDMI and then
     USB-C, came from the monitor's DDC/CI setting being off.
+  - **Then decide: DDC/CI in the helper on an Intel Mac?** Kept `ddcutil`, `ddcctl` and
+    `m1ddc` for now (2026-11-01): their retries, waits and quirk handling are what a
+    rewrite would have to rediscover. Doing it in the helper would drop `ddcctl` and
+    close its renumbering race (D17), since the helper could find a monitor and write
+    to it in one step. If so, adapt MonitorControl's `IntelDDC.swift` (MIT), not
+    `ddcctl` (GPL-3.0) or `ddcutil` (GPL-2.0+), which can't go into Apache-2.0 code.
+    Linux keeps `ddcutil` either way: it has no race to close.
 
 ## Decisions needing review
 
