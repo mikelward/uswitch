@@ -513,7 +513,9 @@ On a Mac (D14–D17), with `m1ddc` from Homebrew:
 
 Python 3.10 or later (Ubuntu 22.04's), standard library only, in one executable file,
 `uswitch`, that runs from a checkout with no build step. On Linux `ddcutil` is the only
-external binary. The configuration is read and written with `configparser`.
+external binary. The configuration is read and written with `configparser`. `make
+install` and `make uninstall` are shorthands for `./uswitch install` and `uninstall`, with
+`PYTHON` naming the interpreter.
 
 On a Mac, `uswitch` needs Homebrew's Python, since the one with the Command Line Tools is
 3.9, and `install` records which interpreter runs it. Its external binaries are `m1ddc`,

@@ -25,7 +25,7 @@ through `ddcutil`. Linux with systemd, and Apple silicon Macs
 From a checkout, on each machine:
 
 ```sh
-sudo ./uswitch install
+sudo make install    # runs ./uswitch install
 ```
 
 That installs `/usr/local/sbin/uswitch` and a systemd unit, then runs
@@ -58,7 +58,7 @@ journalctl -u uswitch           # what each run did, and how long it took
 ## Uninstall
 
 ```sh
-sudo uswitch uninstall            # keeps /etc/uswitch.conf
+sudo make uninstall               # keeps /etc/uswitch.conf
 sudo uswitch uninstall --purge    # removes it too
 ```
 
@@ -86,7 +86,7 @@ Macs aren't supported: the one tried passed no DDC/CI to the monitor.
 From a checkout, with Homebrew's Python and without `sudo`:
 
 ```sh
-"$(brew --prefix)/bin/python3" ./uswitch install
+make install PYTHON="$(brew --prefix)/bin/python3"
 ```
 
 That installs `~/.local/bin/uswitch`, builds the helper, and loads a
